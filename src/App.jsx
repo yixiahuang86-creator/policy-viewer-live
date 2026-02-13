@@ -17,15 +17,28 @@ const TENANT_MAP = {
 
 const TENANT_IDS = Object.keys(TENANT_MAP).map(Number)
 
+// --- Cookie storage key ---
+const COOKIE_STORAGE_KEY = 'pms_session_cookie'
+
+function getSavedCookie() {
+  try { return localStorage.getItem(COOKIE_STORAGE_KEY) || '' } catch { return '' }
+}
+
+function saveCookie(cookie) {
+  try { localStorage.setItem(COOKIE_STORAGE_KEY, cookie) } catch { /* ignore */ }
+}
+
 // --- API fetch helpers ---
 
-async function fetchTenantList(tenantId) {
+async function fetchTenantList(tenantId, cookie) {
+  const headers = {
+    'Content-Type': 'application/json',
+    'tenant_id': String(tenantId),
+  }
+  if (cookie) headers['X-PMS-Cookie'] = cookie
   const res = await fetch('/gateway/policy/search/v2', {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'tenant_id': String(tenantId),
-    },
+    headers,
     body: JSON.stringify({
       param: { filter: { level: [] } },
       returnConfig: { page: 1, limit: 99999, highLightConfig: { fragmentSize: 200 } },
@@ -33,13 +46,17 @@ async function fetchTenantList(tenantId) {
   })
   if (!res.ok) throw new Error(`List API failed for tenant ${tenantId}: ${res.status}`)
   const json = await res.json()
+  if (json.code === 401) throw new Error('AUTH_REQUIRED')
   return json.data?.data || []
 }
 
-async function fetchPolicyDetail(regionPolicyID) {
-  const res = await fetch(`/api/cms/v3/policy/get_region_policy_by_id?id=${regionPolicyID}&languageCodes=en`)
+async function fetchPolicyDetail(regionPolicyID, cookie) {
+  const headers = {}
+  if (cookie) headers['X-PMS-Cookie'] = cookie
+  const res = await fetch(`/api/cms/v3/policy/get_region_policy_by_id?id=${regionPolicyID}&languageCodes=en`, { headers })
   if (!res.ok) throw new Error(`Detail API failed for ${regionPolicyID}: ${res.status}`)
   const json = await res.json()
+  if (json.code === 401) throw new Error('AUTH_REQUIRED')
   return json.data || {}
 }
 
@@ -1167,6 +1184,50 @@ function RegionMatrix({ rows, regions, selectedTenant, onRowClick, showDiffOnly,
   )
 }
 
+// --- Cookie prompt screen ---
+
+function CookiePrompt({ error, onSubmit, savedCookie }) {
+  const [input, setInput] = useState(savedCookie || '')
+
+  const handleSubmit = (e) => {
+    e.preventDefault()
+    if (input.trim()) onSubmit(input)
+  }
+
+  return (
+    <div className="loading-overlay">
+      <div className="auth-card">
+        <div className="auth-title">Policy Viewer (Live)</div>
+        <div className="auth-description">
+          This app fetches live data from PMS. To authenticate, paste your session cookie from
+          <strong> pms-va.tiktok-row.net</strong>.
+        </div>
+        <div className="auth-steps">
+          <div className="auth-step">1. Open <strong>pms-va.tiktok-row.net</strong> in your browser and log in</div>
+          <div className="auth-step">2. Open DevTools (F12) &rarr; Application &rarr; Cookies</div>
+          <div className="auth-step">3. Copy all cookies (or just the session/auth cookies) as a single string</div>
+          <div className="auth-step">
+            <em>Tip: In Chrome DevTools Console, type <code>document.cookie</code> and copy the result</em>
+          </div>
+        </div>
+        {error && <div className="auth-error">{error}</div>}
+        <form onSubmit={handleSubmit} className="auth-form">
+          <textarea
+            className="auth-input"
+            placeholder="Paste cookie string here... (e.g. session_id=abc123; csrftoken=xyz)"
+            value={input}
+            onChange={e => setInput(e.target.value)}
+            rows={3}
+          />
+          <button type="submit" className="auth-submit" disabled={!input.trim()}>
+            Connect
+          </button>
+        </form>
+      </div>
+    </div>
+  )
+}
+
 // --- App ---
 
 export default function App() {
@@ -1187,15 +1248,25 @@ export default function App() {
   const [showDiffOnly, setShowDiffOnly] = useState(false)
   const [ageFilter, setAgeFilter] = useState('both')
   const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false)
+  const [cookie, setCookie] = useState(getSavedCookie)
+  const [needsAuth, setNeedsAuth] = useState(!getSavedCookie())
 
   const fetchAbortRef = useRef(null)
 
-  const loadData = useCallback(async () => {
+  const loadData = useCallback(async (cookieOverride) => {
+    const activeCookie = cookieOverride !== undefined ? cookieOverride : cookie
+    if (!activeCookie) {
+      setNeedsAuth(true)
+      setLoading(false)
+      return
+    }
+
     // Abort any previous fetch
     if (fetchAbortRef.current) fetchAbortRef.current.aborted = true
     const thisRun = { aborted: false }
     fetchAbortRef.current = thisRun
 
+    setNeedsAuth(false)
     setLoading(true)
     setError(null)
     setLoadPhase('lists')
@@ -1206,7 +1277,7 @@ export default function App() {
       const listResults = await batchFetch(
         TENANT_IDS,
         async (tenantId) => {
-          const items = await fetchTenantList(tenantId)
+          const items = await fetchTenantList(tenantId, activeCookie)
           return { tenantId, items }
         },
         11,  // All 11 in parallel
@@ -1219,7 +1290,6 @@ export default function App() {
 
       // Build a flat list of (tenantId, tenantName, listItem) to fetch details for
       const detailTasks = []
-      const seenPolicyIds = new Map() // regionPolicyID → index in detailTasks (dedup)
 
       for (const result of listResults) {
         if (!result) continue
@@ -1227,8 +1297,6 @@ export default function App() {
         const tenantName = TENANT_MAP[tenantId]
         for (const item of items) {
           if (!item.regionPolicyID) continue
-          // Each tenant-policy combination needs its own detail fetch
-          // But the same regionPolicyID may appear across tenants; we still need per-tenant entries
           detailTasks.push({
             tenantId,
             tenantName,
@@ -1257,7 +1325,7 @@ export default function App() {
           if (detailFetchCache.has(task.regionPolicyID)) {
             detailData = detailFetchCache.get(task.regionPolicyID)
           } else {
-            detailData = await fetchPolicyDetail(task.regionPolicyID)
+            detailData = await fetchPolicyDetail(task.regionPolicyID, activeCookie)
             detailFetchCache.set(task.regionPolicyID, detailData)
           }
           const entries = transformDetailToEntries(detailData, task.tenantId, task.tenantName, task.listItem)
@@ -1287,16 +1355,31 @@ export default function App() {
     } catch (err) {
       if (!thisRun.aborted) {
         console.error('Failed to load data:', err)
-        setError(err.message)
-        setLoading(false)
-        setLoadPhase('')
+        if (err.message === 'AUTH_REQUIRED') {
+          setNeedsAuth(true)
+          setLoading(false)
+          setLoadPhase('')
+          setError('Session expired or invalid. Please update your cookie.')
+        } else {
+          setError(err.message)
+          setLoading(false)
+          setLoadPhase('')
+        }
       }
     }
-  }, [])
+  }, [cookie])
+
+  const handleCookieSubmit = useCallback((newCookie) => {
+    const trimmed = newCookie.trim()
+    setCookie(trimmed)
+    saveCookie(trimmed)
+    setNeedsAuth(false)
+    loadData(trimmed)
+  }, [loadData])
 
   useEffect(() => {
-    loadData()
-  }, [loadData])
+    if (cookie) loadData()
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
 
   // Fuzzy-group all data once
   const fuzzyGroups = useMemo(() => {
@@ -1446,6 +1529,11 @@ export default function App() {
 
   const closeModal = useCallback(() => setModalData(null), [])
 
+  // --- Auth screen ---
+  if (needsAuth || (!loading && !data && !error)) {
+    return <CookiePrompt error={error} onSubmit={handleCookieSubmit} savedCookie={cookie} />
+  }
+
   // --- Loading state ---
   if (loading) {
     const pct = loadProgress.total > 0
@@ -1469,22 +1557,8 @@ export default function App() {
     )
   }
 
-  if (error) {
-    return (
-      <div className="loading-overlay">
-        <div className="loading-text" style={{ color: '#ef4444' }}>Error: {error}</div>
-        <button className="refresh-btn" onClick={loadData}>Retry</button>
-      </div>
-    )
-  }
-
-  if (!data) {
-    return (
-      <div className="loading-overlay">
-        <div className="spinner" />
-        <div className="loading-text">Loading policy data...</div>
-      </div>
-    )
+  if (error && !data) {
+    return <CookiePrompt error={error} onSubmit={handleCookieSubmit} savedCookie={cookie} />
   }
 
   const currentRows = activeTab === 'tenant' ? filteredTenantRows : filteredRegionRows
