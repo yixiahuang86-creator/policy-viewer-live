@@ -36,7 +36,7 @@ async function fetchTenantList(tenantId, cookie) {
     'tenant_id': String(tenantId),
   }
   if (cookie) headers['X-PMS-Cookie'] = cookie
-  const res = await fetch('https://pms-va.tiktok-row.net/gateway/policy/search/v2', {
+  const res = await fetch('/gateway/policy/search/v2', {
     method: 'POST',
     headers,
     body: JSON.stringify({
@@ -53,7 +53,7 @@ async function fetchTenantList(tenantId, cookie) {
 async function fetchPolicyDetail(regionPolicyID, cookie) {
   const headers = {}
   if (cookie) headers['X-PMS-Cookie'] = cookie
-  const res = await fetch(`https://pms-va.tiktok-row.net/api/cms/v3/policy/get_region_policy_by_id?id=${regionPolicyID}&languageCodes=en`, { headers })
+  const res = await fetch(`/api/cms/v3/policy/get_region_policy_by_id?id=${regionPolicyID}&languageCodes=en`, { headers })
   if (!res.ok) throw new Error(`Detail API failed for ${regionPolicyID}: ${res.status}`)
   const json = await res.json()
   if (json.code === 401) throw new Error('AUTH_REQUIRED')
