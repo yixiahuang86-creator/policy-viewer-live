@@ -1232,7 +1232,7 @@ function CookiePrompt({ error, onSubmit, savedCookie }) {
 
 export default function App() {
   const [data, setData] = useState(null)
-  const [loading, setLoading] = useState(true)
+  const [loading, setLoading] = useState(false)
   const [loadPhase, setLoadPhase] = useState('')  // 'lists' | 'details' | ''
   const [loadProgress, setLoadProgress] = useState({ done: 0, total: 0 })
   const [lastFetched, setLastFetched] = useState(null)
