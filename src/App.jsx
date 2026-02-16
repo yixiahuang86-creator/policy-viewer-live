@@ -33,7 +33,7 @@ function saveCookie(cookie) {
 async function fetchTenantList(tenantId, cookie) {
   const headers = {
     'Content-Type': 'application/json',
-    'tenant_id': String(tenantId),
+    'Tenant': String(tenantId),
   }
   if (cookie) headers['X-PMS-Cookie'] = cookie
   const res = await fetch('/gateway/policy/search/v2', {
@@ -50,8 +50,8 @@ async function fetchTenantList(tenantId, cookie) {
   return json.data?.data || []
 }
 
-async function fetchPolicyDetail(regionPolicyID, cookie) {
-  const headers = {}
+async function fetchPolicyDetail(regionPolicyID, tenantId, cookie) {
+  const headers = { 'Tenant': String(tenantId) }
   if (cookie) headers['X-PMS-Cookie'] = cookie
   const res = await fetch(`/api/cms/v3/policy/get_region_policy_by_id?id=${regionPolicyID}&languageCodes=en`, { headers })
   if (!res.ok) throw new Error(`Detail API failed for ${regionPolicyID}: ${res.status}`)
@@ -1322,11 +1322,12 @@ export default function App() {
         detailTasks,
         async (task) => {
           let detailData
-          if (detailFetchCache.has(task.regionPolicyID)) {
-            detailData = detailFetchCache.get(task.regionPolicyID)
+          const cacheKey = `${task.tenantId}:${task.regionPolicyID}`
+          if (detailFetchCache.has(cacheKey)) {
+            detailData = detailFetchCache.get(cacheKey)
           } else {
-            detailData = await fetchPolicyDetail(task.regionPolicyID, activeCookie)
-            detailFetchCache.set(task.regionPolicyID, detailData)
+            detailData = await fetchPolicyDetail(task.regionPolicyID, task.tenantId, activeCookie)
+            detailFetchCache.set(cacheKey, detailData)
           }
           const entries = transformDetailToEntries(detailData, task.tenantId, task.tenantName, task.listItem)
           return entries
