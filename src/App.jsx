@@ -281,16 +281,6 @@ async function batchFetch(items, fn, concurrency, onProgress) {
   return results
 }
 
-// --- Detail cache (preserved for lazy detail fetch from modal) ---
-
-const detailCache = {}
-
-async function fetchDetail(id) {
-  if (detailCache[id]) return detailCache[id]
-  // In live mode, we don't have batch files. Return null — details are already in the data.
-  return null
-}
-
 // --- Fuzzy title grouping utilities (preserved) ---
 
 function normalizeForGrouping(title) {
@@ -300,7 +290,7 @@ function normalizeForGrouping(title) {
 }
 
 function wordTokens(str) {
-  return str.split(/[\s\-–—,;:()\/]+/).filter(w => w.length > 1)
+  return str.split(/[\s\-–—,;:()/]+/).filter(w => w.length > 1)
 }
 
 function jaccardSimilarity(a, b) {
@@ -425,19 +415,6 @@ function actionShort(val) {
   if (lower.includes('approve')) return 'Approve'
   if (lower === 'general') return 'General'
   return val.length > 8 ? val.slice(0, 8) + '\u2026' : val
-}
-
-function mode(arr) {
-  const counts = {}
-  for (const v of arr) {
-    const key = v || ''
-    counts[key] = (counts[key] || 0) + 1
-  }
-  let best = '', bestCount = 0
-  for (const [k, c] of Object.entries(counts)) {
-    if (c > bestCount) { best = k; bestCount = c }
-  }
-  return best
 }
 
 function ActionBadge({ value }) {
@@ -938,7 +915,7 @@ function buildCategoryTableRows(categories, columnOrder, onRowClick, groupPrefix
 
 // --- Tenant Matrix (View 1) with categories + anchor groups ---
 
-function TenantMatrix({ rows, tenants, anchorTenant, onRowClick, columnOrder, dragProps, ageFilter = 'both' }) {
+function TenantMatrix({ rows, anchorTenant, onRowClick, columnOrder, dragProps, ageFilter = 'both' }) {
   const { dragOverIdx, onDragStart, onDragOver, onDragLeave, onDrop } = dragProps
 
   const { anchorCategoriesRaw, nonAnchorCategoriesRaw, anchorCount, nonAnchorCount, allCatNames } = useMemo(() => {
@@ -1037,7 +1014,6 @@ function TenantMatrix({ rows, tenants, anchorTenant, onRowClick, columnOrder, dr
   }, [anchorCategories, nonAnchorCategories, nonAnchorOpen])
 
   const showBothAge = ageFilter === 'both'
-  const showAdult = ageFilter === 'both' || ageFilter === 'adult'
   const showU18 = ageFilter === 'both' || ageFilter === 'u18'
 
   const renderHeader = () => (
@@ -1632,11 +1608,6 @@ export default function App() {
     return [...new Set(data.filter(e => e.cat0).map(e => e.cat0))].sort()
   }, [data])
 
-  const allRegions = useMemo(() => {
-    if (!data) return []
-    return [...new Set(data.map(e => e.region))].sort()
-  }, [data])
-
   const tenantRegions = useMemo(() => {
     if (!data || !selectedTenant) return []
     const regions = new Set()
@@ -1977,7 +1948,6 @@ export default function App() {
       {activeTab === 'tenant' ? (
         <TenantMatrix
           rows={filteredTenantRows}
-          tenants={dragProps.columnOrder}
           anchorTenant={anchorTenant}
           onRowClick={handleTenantRowClick}
           columnOrder={dragProps.columnOrder}
