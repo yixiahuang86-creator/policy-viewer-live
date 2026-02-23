@@ -17,6 +17,37 @@ const TENANT_MAP = {
 
 const TENANT_IDS = Object.keys(TENANT_MAP).map(Number)
 
+// --- IndexedDB Cache Layer ---
+
+function openCacheDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open('pms-cache', 1)
+    req.onupgradeneeded = () => { req.result.createObjectStore('data') }
+    req.onsuccess = () => resolve(req.result)
+    req.onerror = () => reject(req.error)
+  })
+}
+
+async function getCachedData() {
+  try {
+    const db = await openCacheDB()
+    return new Promise((resolve) => {
+      const tx = db.transaction('data', 'readonly')
+      const req = tx.objectStore('data').get('entries')
+      req.onsuccess = () => resolve(req.result || null)
+      req.onerror = () => resolve(null)
+    })
+  } catch { return null }
+}
+
+async function setCachedData(entries) {
+  try {
+    const db = await openCacheDB()
+    const tx = db.transaction('data', 'readwrite')
+    tx.objectStore('data').put({ entries, timestamp: Date.now() }, 'entries')
+  } catch { /* ignore */ }
+}
+
 // --- Cookie storage key ---
 const COOKIE_STORAGE_KEY = 'pms_session_cookie'
 
@@ -60,6 +91,97 @@ async function fetchPolicyDetail(regionPolicyID, tenantId, cookie) {
   return json.data || {}
 }
 
+// --- RPF Region Discovery ---
+// The list API returns one entry per policy (General region). For RPF policies,
+// we need to discover all regional variants via additional API calls.
+
+// Try multiple possible API endpoints to find one that returns regional data.
+// Returns { endpoint, fetcher } or null if none work.
+let _rpfApiEndpoint = null // cached after first successful discovery
+
+async function tryFetch(url, headers, method = 'GET', body = null) {
+  try {
+    const opts = { method, headers }
+    if (body) opts.body = JSON.stringify(body)
+    const res = await fetch(url, opts)
+    if (!res.ok) return null
+    const json = await res.json()
+    if (json.code === 200 || json.code === 0) return json
+    return null
+  } catch { return null }
+}
+
+async function discoverRPFApi(sampleUid, sampleRegionPolicyID, tenantId, cookie) {
+  if (_rpfApiEndpoint) return _rpfApiEndpoint
+
+  const headers = { 'Tenant': String(tenantId) }
+  if (cookie) headers['X-PMS-Cookie'] = cookie
+  const postHeaders = { ...headers, 'Content-Type': 'application/json' }
+
+  // Strategy A: get policy detail by uid (might return all regions)
+  const endpointsGET = [
+    `/api/cms/v3/rpf/get_region_list?uid=${sampleUid}&languageCodes=en`,
+    `/api/cms/v3/rpf/detail?uid=${sampleUid}&languageCodes=en`,
+    `/api/cms/v3/rpf/get_policy_detail?uid=${sampleUid}&languageCodes=en`,
+    `/api/cms/v3/policy/get_by_uid?uid=${sampleUid}&languageCodes=en`,
+    `/api/cms/v3/policy/get_rpf_detail?uid=${sampleUid}&languageCodes=en`,
+    `/api/cms/v3/rpf/region_policies?uid=${sampleUid}`,
+    `/api/cms/v3/rpf/regions?policy_id=${sampleRegionPolicyID}`,
+    `/api/cms/v3/policy/get_region_policies_by_uid?uid=${sampleUid}`,
+    `/api/cms/v3/policy/rpf_regions?uid=${sampleUid}`,
+    `/api/cms/v3/rpf/get_all_region_policies?uid=${sampleUid}&languageCodes=en`,
+  ]
+
+  for (const ep of endpointsGET) {
+    const basePath = ep.split('?')[0].replace(sampleUid, '{uid}').replace(String(sampleRegionPolicyID), '{id}')
+    console.log(`[RPF Discovery] Trying GET ${ep}...`)
+    const json = await tryFetch(ep, headers)
+    if (json) {
+      console.log(`[RPF Discovery] SUCCESS: GET ${basePath}`, json)
+      _rpfApiEndpoint = { type: 'GET', template: basePath }
+      return _rpfApiEndpoint
+    }
+  }
+
+  // Strategy B: try POST endpoints via gateway
+  const postEndpoints = [
+    { url: '/gateway/rpf/detail/v2', body: { uid: sampleUid } },
+    { url: '/gateway/rpf/regions/v2', body: { uid: sampleUid } },
+    { url: '/gateway/rpf/region_list/v2', body: { uid: sampleUid, languageCodes: ['en'] } },
+  ]
+
+  for (const { url, body } of postEndpoints) {
+    console.log(`[RPF Discovery] Trying POST ${url}...`)
+    const json = await tryFetch(url, postHeaders, 'POST', body)
+    if (json) {
+      console.log(`[RPF Discovery] SUCCESS: POST ${url}`, json)
+      _rpfApiEndpoint = { type: 'POST', url }
+      return _rpfApiEndpoint
+    }
+  }
+
+  console.log('[RPF Discovery] No RPF regional API found. Regional data may be limited to General.')
+  return null
+}
+
+// Fetch all regional variants for an RPF policy using discovered endpoint
+async function fetchRPFRegions(uid, regionPolicyID, tenantId, cookie) {
+  if (!_rpfApiEndpoint) return null
+  const headers = { 'Tenant': String(tenantId) }
+  if (cookie) headers['X-PMS-Cookie'] = cookie
+
+  if (_rpfApiEndpoint.type === 'GET') {
+    const url = _rpfApiEndpoint.template
+      .replace('{uid}', uid)
+      .replace('{id}', String(regionPolicyID))
+      + `?uid=${uid}&languageCodes=en`
+    return tryFetch(url, headers)
+  } else {
+    const postHeaders = { ...headers, 'Content-Type': 'application/json' }
+    return tryFetch(_rpfApiEndpoint.url, postHeaders, 'POST', { uid, languageCodes: ['en'] })
+  }
+}
+
 // --- Transform detail response → flat entries matching current format ---
 
 function transformDetailToEntries(detailData, tenantId, tenantName, listItem) {
@@ -70,12 +192,12 @@ function transformDetailToEntries(detailData, tenantId, tenantName, listItem) {
     const ageGroup = results['Age Group']
     const entry = {
       policy_title: listItem.title,
-      policy_code: listItem.uid || detailData.uid || '',
+      policy_code: regionData.uid || listItem.uid || detailData.uid || '',
       region: regionName,
       cat0: listItem.categoryCodes?.[0] || '',
       cat1: listItem.categoryCodes?.[1] || '',
       labels: listItem.labels || [],
-      level: detailData.level || '',
+      level: detailData.level || regionData.level || '',
       results: results,
       adult_action: ageGroup?.Adult?.Action || results?.Action || '',
       late_teen_action: ageGroup?.['Late teen']?.Action || '',
@@ -86,6 +208,50 @@ function transformDetailToEntries(detailData, tenantId, tenantName, listItem) {
     }
     entries.push(entry)
   }
+  return entries
+}
+
+// Transform RPF region list into flat entries (if the RPF API returns a different format)
+function transformRPFRegionsToEntries(rpfData, tenantId, tenantName, listItem) {
+  // The RPF API might return data in several formats:
+  // Format A: { regions: { "General": {...}, "JP": {...} } } (same as detail)
+  // Format B: [{ area_code: "General", ... }, { area_code: "JP", ... }] (array)
+  // Format C: { region_policies: [{ area_code: "General", id: 123, ... }, ...] }
+  const entries = []
+
+  if (!rpfData) return entries
+
+  // Format A: regions dict (same as detail API)
+  if (rpfData.regions && typeof rpfData.regions === 'object') {
+    return transformDetailToEntries(rpfData, tenantId, tenantName, listItem)
+  }
+
+  // Format C: region_policies array
+  const regionList = rpfData.region_policies || rpfData.data || (Array.isArray(rpfData) ? rpfData : null)
+  if (Array.isArray(regionList)) {
+    for (const rp of regionList) {
+      const regionName = rp.area_code || rp.region || 'General'
+      const results = rp.condition_results || {}
+      const ageGroup = results['Age Group']
+      entries.push({
+        policy_title: listItem.title,
+        policy_code: rp.uid || listItem.uid || '',
+        region: regionName,
+        cat0: listItem.categoryCodes?.[0] || '',
+        cat1: listItem.categoryCodes?.[1] || '',
+        labels: listItem.labels || [],
+        level: rp.level || '',
+        results: results,
+        adult_action: ageGroup?.Adult?.Action || results?.Action || '',
+        late_teen_action: ageGroup?.['Late teen']?.Action || '',
+        early_teen_action: ageGroup?.['Early teen']?.Action || '',
+        children_action: ageGroup?.Children?.Action || '',
+        tenant_id: tenantId,
+        tenant_name: tenantName,
+      })
+    }
+  }
+
   return entries
 }
 
@@ -1248,10 +1414,12 @@ export default function App() {
   const [showDiffOnly, setShowDiffOnly] = useState(false)
   const [ageFilter, setAgeFilter] = useState('both')
   const [mobileFiltersOpen, setMobileFiltersOpen] = useState(false)
+  const [isRefreshing, setIsRefreshing] = useState(false)
   const [cookie, setCookie] = useState(getSavedCookie)
   const [needsAuth, setNeedsAuth] = useState(!getSavedCookie())
 
   const fetchAbortRef = useRef(null)
+  const dataRef = useRef([])
 
   const loadData = useCallback(async (cookieOverride) => {
     const activeCookie = cookieOverride !== undefined ? cookieOverride : cookie
@@ -1267,8 +1435,18 @@ export default function App() {
     fetchAbortRef.current = thisRun
 
     setNeedsAuth(false)
-    setLoading(true)
     setError(null)
+
+    // Try IndexedDB cache first
+    const cached = await getCachedData()
+    if (cached && cached.entries && cached.entries.length > 0) {
+      setData(cached.entries)
+      setLastFetched(cached.timestamp ? new Date(cached.timestamp) : null)
+      setIsRefreshing(true)
+    } else {
+      setLoading(true)
+    }
+
     setLoadPhase('lists')
     setLoadProgress({ done: 0, total: TENANT_IDS.length })
 
@@ -1308,19 +1486,59 @@ export default function App() {
 
       if (thisRun.aborted) return
 
+      // Phase 1.5: Discover RPF regional API (try once with first RPF policy)
+      setLoadPhase('discovering')
+      const sampleRPF = detailTasks.find(t => t.listItem.isRPF)
+      if (sampleRPF) {
+        console.log('[RPF] Discovering regional API using sample policy:', sampleRPF.listItem.uid, sampleRPF.listItem.title)
+        await discoverRPFApi(sampleRPF.listItem.uid, sampleRPF.regionPolicyID, sampleRPF.tenantId, activeCookie)
+      }
+
+      if (thisRun.aborted) return
+
       // Phase 2: Fetch details with concurrency limit
       setLoadPhase('details')
       setLoadProgress({ done: 0, total: detailTasks.length })
 
       // Deduplicate detail fetches by regionPolicyID (cache detail results)
       const detailFetchCache = new Map()
+      const rpfCache = new Map()
 
-      const allEntries = []
+      // Reset dataRef for progressive flush
+      dataRef.current = []
       let entryId = 0
+      let lastFlush = 0
 
-      const detailResults = await batchFetch(
+      // Log region distribution for debugging
+      const regionCounts = {}
+
+      await batchFetch(
         detailTasks,
         async (task) => {
+          let entries
+
+          // For RPF policies, try the RPF regional API first
+          if (task.listItem.isRPF && _rpfApiEndpoint) {
+            const rpfCacheKey = `${task.tenantId}:${task.listItem.uid}`
+            if (!rpfCache.has(rpfCacheKey)) {
+              const rpfResult = await fetchRPFRegions(task.listItem.uid, task.regionPolicyID, task.tenantId, activeCookie)
+              rpfCache.set(rpfCacheKey, rpfResult)
+            }
+            const rpfData = rpfCache.get(rpfCacheKey)
+            if (rpfData?.data) {
+              entries = transformRPFRegionsToEntries(rpfData.data, task.tenantId, task.tenantName, task.listItem)
+              if (entries.length > 0) {
+                for (const e of entries) {
+                  e.id = entryId++
+                  regionCounts[e.region] = (regionCounts[e.region] || 0) + 1
+                }
+                dataRef.current.push(...entries)
+                return entries
+              }
+            }
+          }
+
+          // Fallback: use the standard detail API
           let detailData
           const cacheKey = `${task.tenantId}:${task.regionPolicyID}`
           if (detailFetchCache.has(cacheKey)) {
@@ -1329,41 +1547,55 @@ export default function App() {
             detailData = await fetchPolicyDetail(task.regionPolicyID, task.tenantId, activeCookie)
             detailFetchCache.set(cacheKey, detailData)
           }
-          const entries = transformDetailToEntries(detailData, task.tenantId, task.tenantName, task.listItem)
+          entries = transformDetailToEntries(detailData, task.tenantId, task.tenantName, task.listItem)
+          for (const e of entries) {
+            e.id = entryId++
+            regionCounts[e.region] = (regionCounts[e.region] || 0) + 1
+          }
+          dataRef.current.push(...entries)
           return entries
         },
         20,  // 20 concurrent requests
         (done, total) => {
-          if (!thisRun.aborted) setLoadProgress({ done, total })
+          if (thisRun.aborted) return
+          setLoadProgress({ done, total })
+          // Progressive flush: every ~50 completions, push partial data to UI
+          if (done - lastFlush >= 50) {
+            lastFlush = done
+            setData([...dataRef.current])
+          }
         }
       )
 
       if (thisRun.aborted) return
 
-      // Flatten all entries and assign IDs
-      for (const entries of detailResults) {
-        if (!entries) continue
-        for (const entry of entries) {
-          entry.id = entryId++
-          allEntries.push(entry)
-        }
-      }
+      console.log('[Data] Region distribution:', regionCounts)
+
+      const allEntries = dataRef.current
+
+      console.log(`[Data] Total entries: ${allEntries.length}, Unique regions: ${[...new Set(allEntries.map(e => e.region))].join(', ')}`)
 
       setData(allEntries)
       setLastFetched(new Date())
       setLoading(false)
+      setIsRefreshing(false)
       setLoadPhase('')
+
+      // Save to IndexedDB cache
+      setCachedData(allEntries)
     } catch (err) {
       if (!thisRun.aborted) {
         console.error('Failed to load data:', err)
         if (err.message === 'AUTH_REQUIRED') {
           setNeedsAuth(true)
           setLoading(false)
+          setIsRefreshing(false)
           setLoadPhase('')
           setError('Session expired or invalid. Please update your cookie.')
         } else {
           setError(err.message)
           setLoading(false)
+          setIsRefreshing(false)
           setLoadPhase('')
         }
       }
@@ -1535,16 +1767,18 @@ export default function App() {
     return <CookiePrompt error={error} onSubmit={handleCookieSubmit} savedCookie={cookie} />
   }
 
-  // --- Loading state ---
-  if (loading) {
+  // --- Loading state (only block UI when there's no data to show) ---
+  if (loading && !data) {
     const pct = loadProgress.total > 0
       ? Math.round((loadProgress.done / loadProgress.total) * 100)
       : 0
     const phaseLabel = loadPhase === 'lists'
       ? `Loading policies... ${loadProgress.done}/${loadProgress.total} tenants`
-      : loadPhase === 'details'
-        ? `Loading details... ${loadProgress.done}/${loadProgress.total} policies`
-        : 'Initializing...'
+      : loadPhase === 'discovering'
+        ? 'Discovering regional APIs...'
+        : loadPhase === 'details'
+          ? `Loading details... ${loadProgress.done}/${loadProgress.total} policies`
+          : 'Initializing...'
 
     return (
       <div className="loading-overlay">
@@ -1566,25 +1800,75 @@ export default function App() {
 
   return (
     <div className="app">
-      {/* Toolbar */}
-      <div className="toolbar">
-        <div className="toolbar-primary">
-          <span className="toolbar-title">Policy Viewer (Live)</span>
-
-          <div className="tab-switcher">
+      {/* Dark Navbar */}
+      <nav className="pms-navbar">
+        <div className="navbar-left">
+          <span className="navbar-logo">Policy Viewer</span>
+          <div className="navbar-nav">
             <button
-              className={`tab-btn${activeTab === 'tenant' ? ' active' : ''}`}
+              className={`navbar-nav-item${activeTab === 'tenant' ? ' active' : ''}`}
               onClick={() => setActiveTab('tenant')}
             >
               Features
             </button>
             <button
-              className={`tab-btn${activeTab === 'region' ? ' active' : ''}`}
+              className={`navbar-nav-item${activeTab === 'region' ? ' active' : ''}`}
               onClick={() => setActiveTab('region')}
             >
               Regions
             </button>
           </div>
+        </div>
+        <div className="navbar-right">
+          <button className="navbar-refresh-btn" onClick={loadData} title="Refresh data from API">
+            {'\u21BB'}
+          </button>
+          {lastFetched && (
+            <span className="navbar-timestamp" title={lastFetched.toLocaleString()}>
+              {lastFetched.toLocaleTimeString()}
+            </span>
+          )}
+        </div>
+      </nav>
+
+      {/* Status bar — updated-as-of + optional refresh callout */}
+      {(isRefreshing || lastFetched) && (
+        <div className="status-bar">
+          {lastFetched && (
+            <div className="updated-as-of">
+              Updated as of <strong>{lastFetched.toLocaleString()}</strong>
+            </div>
+          )}
+          {isRefreshing && (
+            <div className="refresh-callout">
+              <div className="refresh-callout-text">
+                <span className="refresh-callout-icon">{'\u21BB'}</span>
+                <span>
+                  {loadPhase === 'lists'
+                    ? `Fetching policy lists\u2026 ${loadProgress.done}/${loadProgress.total} tenants`
+                    : loadPhase === 'discovering'
+                      ? 'Discovering regional APIs\u2026'
+                      : loadPhase === 'details'
+                        ? `Loading latest data\u2026 ${loadProgress.done} / ${loadProgress.total} policies`
+                        : 'Refreshing\u2026'}
+                </span>
+                <span className="refresh-callout-hint">Data will update once completed.</span>
+              </div>
+              <div className="refresh-callout-bar-track">
+                <div
+                  className="refresh-callout-bar-fill"
+                  style={{ width: `${loadProgress.total > 0 ? Math.round((loadProgress.done / loadProgress.total) * 100) : 0}%` }}
+                />
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Filter Bar */}
+      <div className="toolbar">
+        <div className="toolbar-primary">
+          <h1 className="page-title">Policy</h1>
 
           <input
             className="search-input"
@@ -1601,16 +1885,6 @@ export default function App() {
           >
             {mobileFiltersOpen ? '\u2715' : '\u2630'}
           </button>
-
-          <button className="refresh-btn" onClick={loadData} title="Refresh data from API">
-            {'\u21BB'}
-          </button>
-
-          {lastFetched && (
-            <span className="last-fetched" title={lastFetched.toLocaleString()}>
-              {lastFetched.toLocaleTimeString()}
-            </span>
-          )}
 
           <span className="result-count">
             {currentRows.length} policies
