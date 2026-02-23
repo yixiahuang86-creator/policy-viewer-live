@@ -1445,6 +1445,7 @@ export default function App() {
       setIsRefreshing(true)
     } else {
       setLoading(true)
+      setIsRefreshing(true)
     }
 
     setLoadPhase('lists')
