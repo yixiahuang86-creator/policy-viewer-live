@@ -1,4 +1,5 @@
 import { useState, useEffect, useMemo, useCallback, useRef, Fragment } from 'react'
+import { createPortal } from 'react-dom'
 
 // --- Tenant ID → Name mapping ---
 const TENANT_MAP = {
@@ -16,6 +17,7 @@ const TENANT_MAP = {
 }
 
 const TENANT_IDS = Object.keys(TENANT_MAP).map(Number)
+const TENANT_NAME_TO_ID = Object.fromEntries(Object.entries(TENANT_MAP).map(([id, name]) => [name, Number(id)]))
 
 // --- IndexedDB Cache Layer ---
 
@@ -91,104 +93,39 @@ async function fetchPolicyDetail(regionPolicyID, tenantId, cookie) {
   return json.data || {}
 }
 
-// --- RPF Region Discovery ---
-// The list API returns one entry per policy (General region). For RPF policies,
-// we need to discover all regional variants via additional API calls.
+// --- Transform detail response → flat entries matching current format ---
 
-// Try multiple possible API endpoints to find one that returns regional data.
-// Returns { endpoint, fetcher } or null if none work.
-let _rpfApiEndpoint = null // cached after first successful discovery
-
-async function tryFetch(url, headers, method = 'GET', body = null) {
-  try {
-    const opts = { method, headers }
-    if (body) opts.body = JSON.stringify(body)
-    const res = await fetch(url, opts)
-    if (!res.ok) return null
-    const json = await res.json()
-    if (json.code === 200 || json.code === 0) return json
-    return null
-  } catch { return null }
-}
-
-async function discoverRPFApi(sampleUid, sampleRegionPolicyID, tenantId, cookie) {
-  if (_rpfApiEndpoint) return _rpfApiEndpoint
-
-  const headers = { 'Tenant': String(tenantId) }
-  if (cookie) headers['X-PMS-Cookie'] = cookie
-  const postHeaders = { ...headers, 'Content-Type': 'application/json' }
-
-  // Strategy A: get policy detail by uid (might return all regions)
-  const endpointsGET = [
-    `/api/cms/v3/rpf/get_region_list?uid=${sampleUid}&languageCodes=en`,
-    `/api/cms/v3/rpf/detail?uid=${sampleUid}&languageCodes=en`,
-    `/api/cms/v3/rpf/get_policy_detail?uid=${sampleUid}&languageCodes=en`,
-    `/api/cms/v3/policy/get_by_uid?uid=${sampleUid}&languageCodes=en`,
-    `/api/cms/v3/policy/get_rpf_detail?uid=${sampleUid}&languageCodes=en`,
-    `/api/cms/v3/rpf/region_policies?uid=${sampleUid}`,
-    `/api/cms/v3/rpf/regions?policy_id=${sampleRegionPolicyID}`,
-    `/api/cms/v3/policy/get_region_policies_by_uid?uid=${sampleUid}`,
-    `/api/cms/v3/policy/rpf_regions?uid=${sampleUid}`,
-    `/api/cms/v3/rpf/get_all_region_policies?uid=${sampleUid}&languageCodes=en`,
-  ]
-
-  for (const ep of endpointsGET) {
-    const basePath = ep.split('?')[0].replace(sampleUid, '{uid}').replace(String(sampleRegionPolicyID), '{id}')
-    console.log(`[RPF Discovery] Trying GET ${ep}...`)
-    const json = await tryFetch(ep, headers)
-    if (json) {
-      console.log(`[RPF Discovery] SUCCESS: GET ${basePath}`, json)
-      _rpfApiEndpoint = { type: 'GET', template: basePath }
-      return _rpfApiEndpoint
-    }
+// Parse a results value that may be a JSON string, object, or null
+function parseResults(val) {
+  if (!val) return null
+  if (typeof val === 'object') return Object.keys(val).length > 0 ? val : null
+  if (typeof val === 'string') {
+    try {
+      const parsed = JSON.parse(val)
+      return parsed && typeof parsed === 'object' && Object.keys(parsed).length > 0 ? parsed : null
+    } catch { return null }
   }
-
-  // Strategy B: try POST endpoints via gateway
-  const postEndpoints = [
-    { url: '/gateway/rpf/detail/v2', body: { uid: sampleUid } },
-    { url: '/gateway/rpf/regions/v2', body: { uid: sampleUid } },
-    { url: '/gateway/rpf/region_list/v2', body: { uid: sampleUid, languageCodes: ['en'] } },
-  ]
-
-  for (const { url, body } of postEndpoints) {
-    console.log(`[RPF Discovery] Trying POST ${url}...`)
-    const json = await tryFetch(url, postHeaders, 'POST', body)
-    if (json) {
-      console.log(`[RPF Discovery] SUCCESS: POST ${url}`, json)
-      _rpfApiEndpoint = { type: 'POST', url }
-      return _rpfApiEndpoint
-    }
-  }
-
-  console.log('[RPF Discovery] No RPF regional API found. Regional data may be limited to General.')
   return null
 }
-
-// Fetch all regional variants for an RPF policy using discovered endpoint
-async function fetchRPFRegions(uid, regionPolicyID, tenantId, cookie) {
-  if (!_rpfApiEndpoint) return null
-  const headers = { 'Tenant': String(tenantId) }
-  if (cookie) headers['X-PMS-Cookie'] = cookie
-
-  if (_rpfApiEndpoint.type === 'GET') {
-    const url = _rpfApiEndpoint.template
-      .replace('{uid}', uid)
-      .replace('{id}', String(regionPolicyID))
-      + `?uid=${uid}&languageCodes=en`
-    return tryFetch(url, headers)
-  } else {
-    const postHeaders = { ...headers, 'Content-Type': 'application/json' }
-    return tryFetch(_rpfApiEndpoint.url, postHeaders, 'POST', { uid, languageCodes: ['en'] })
-  }
-}
-
-// --- Transform detail response → flat entries matching current format ---
 
 function transformDetailToEntries(detailData, tenantId, tenantName, listItem) {
   const entries = []
   const regions = detailData.regions || {}
-  for (const [regionName, regionData] of Object.entries(regions)) {
-    const results = regionData.condition_results || {}
+  // Process General region first
+  const regionKeys = Object.keys(regions).sort((a, b) => {
+    if (a === 'General') return -1
+    if (b === 'General') return 1
+    return a.localeCompare(b)
+  })
+  for (const regionName of regionKeys) {
+    const regionData = regions[regionName]
+    // condition_results is populated for age-group tenants (Video, PhotoPost).
+    // For others, try regionData.results (JSON string), then fall back to
+    // listItem.results from the search/list API.
+    let results = regionData.condition_results
+    if (!results || Object.keys(results).length === 0) {
+      results = parseResults(regionData.results) || parseResults(listItem.results) || {}
+    }
     const ageGroup = results['Age Group']
     const entry = {
       policy_title: listItem.title,
@@ -208,50 +145,6 @@ function transformDetailToEntries(detailData, tenantId, tenantName, listItem) {
     }
     entries.push(entry)
   }
-  return entries
-}
-
-// Transform RPF region list into flat entries (if the RPF API returns a different format)
-function transformRPFRegionsToEntries(rpfData, tenantId, tenantName, listItem) {
-  // The RPF API might return data in several formats:
-  // Format A: { regions: { "General": {...}, "JP": {...} } } (same as detail)
-  // Format B: [{ area_code: "General", ... }, { area_code: "JP", ... }] (array)
-  // Format C: { region_policies: [{ area_code: "General", id: 123, ... }, ...] }
-  const entries = []
-
-  if (!rpfData) return entries
-
-  // Format A: regions dict (same as detail API)
-  if (rpfData.regions && typeof rpfData.regions === 'object') {
-    return transformDetailToEntries(rpfData, tenantId, tenantName, listItem)
-  }
-
-  // Format C: region_policies array
-  const regionList = rpfData.region_policies || rpfData.data || (Array.isArray(rpfData) ? rpfData : null)
-  if (Array.isArray(regionList)) {
-    for (const rp of regionList) {
-      const regionName = rp.area_code || rp.region || 'General'
-      const results = rp.condition_results || {}
-      const ageGroup = results['Age Group']
-      entries.push({
-        policy_title: listItem.title,
-        policy_code: rp.uid || listItem.uid || '',
-        region: regionName,
-        cat0: listItem.categoryCodes?.[0] || '',
-        cat1: listItem.categoryCodes?.[1] || '',
-        labels: listItem.labels || [],
-        level: rp.level || '',
-        results: results,
-        adult_action: ageGroup?.Adult?.Action || results?.Action || '',
-        late_teen_action: ageGroup?.['Late teen']?.Action || '',
-        early_teen_action: ageGroup?.['Early teen']?.Action || '',
-        children_action: ageGroup?.Children?.Action || '',
-        tenant_id: tenantId,
-        tenant_name: tenantName,
-      })
-    }
-  }
-
   return entries
 }
 
@@ -487,8 +380,16 @@ function getPrimaryAction(entry) {
   if (r['Age Group'] && r['Age Group'].Adult && r['Age Group'].Adult.Action) {
     return r['Age Group'].Adult.Action
   }
+  // Fallback: check nested objects for an Action key (e.g. Effect tenant:
+  // {"Effect": {"Action": "Violation"}, "Icon": {"Action": "..."}, ...})
+  for (const val of Object.values(r)) {
+    if (val && typeof val === 'object' && !Array.isArray(val) && val.Action) {
+      return val.Action
+    }
+  }
   return ''
 }
+
 
 // Tenants that have age-specific fields (adult_action, children_action)
 const AGE_GROUP_TENANTS = new Set(['TikTok-Video-ContentClassification', 'PhotoPost'])
@@ -497,7 +398,7 @@ function getU18Action(entry) {
   if (AGE_GROUP_TENANTS.has(entry.tenant_name)) {
     return entry.children_action || ''
   }
-  return ''
+  return getPrimaryAction(entry) // Non-age tenants: same as adult
 }
 
 // Severity ranking: higher = more severe
@@ -814,20 +715,13 @@ function CategoryJumpNav({ categories, activeCategory, groupPrefix, heading, onR
 // --- Build flat table rows with category label cells ---
 
 function buildCategoryTableRows(categories, columnOrder, onRowClick, groupPrefix, opts = {}) {
-  const { getEntries = (row, col) => row.byTenant.get(col), diffConfig, ageFilter = 'both', selectedTenantForRegion } = opts
+  const { getEntries = (row, col) => row.byTenant.get(col), diffConfig, ageFilter = 'both' } = opts
   const showAdult = ageFilter === 'both' || ageFilter === 'adult'
   const showU18 = ageFilter === 'both' || ageFilter === 'u18'
   const showBoth = showAdult && showU18
 
-  const regionTenantHasAge = selectedTenantForRegion ? AGE_GROUP_TENANTS.has(selectedTenantForRegion) : false
-
   const subColsPerCol = showBoth ? 2 : 1
   const totalSubCols = columnOrder.length * subColsPerCol + 2
-
-  const colHasAge = (col) => {
-    if (selectedTenantForRegion) return regionTenantHasAge
-    return AGE_GROUP_TENANTS.has(col)
-  }
 
   const rows = []
   for (const cat of categories) {
@@ -852,7 +746,6 @@ function buildCategoryTableRows(categories, columnOrder, onRowClick, groupPrefix
           {columnOrder.map((col, i) => {
             const colIdx = i + 1
             const entries = getEntries(row, col)
-            const hasAge = colHasAge(col)
 
             const getDiffClass = (ageGroup) => {
               if (!diffConfig || col === diffConfig.baseCol) return ''
@@ -867,6 +760,7 @@ function buildCategoryTableRows(categories, columnOrder, onRowClick, groupPrefix
             if (showBoth) {
               const adultDiff = getDiffClass('adult')
               const u18Diff = getDiffClass('u18')
+              const isNonAge = entries && entries.length > 0 && !AGE_GROUP_TENANTS.has(entries[0].tenant_name)
               return (
                 <Fragment key={col}>
                   <td className={`sub-col-adult${colIdx % 2 === 0 ? ' col-even' : ' col-odd'}${adultDiff}`}>
@@ -876,8 +770,8 @@ function buildCategoryTableRows(categories, columnOrder, onRowClick, groupPrefix
                       <span className="action-badge empty">{'\u2014'}</span>
                     )}
                   </td>
-                  <td className={`sub-col-u18 sub-col-last${colIdx % 2 === 0 ? ' col-even' : ' col-odd'}${u18Diff}`}>
-                    {entries && hasAge ? (
+                  <td className={`sub-col-u18 sub-col-last${colIdx % 2 === 0 ? ' col-even' : ' col-odd'}${u18Diff}${isNonAge ? ' non-age-tenant' : ''}`}>
+                    {entries ? (
                       <ActionCell entries={entries} ageGroup="u18" />
                     ) : (
                       <span className="action-badge empty">{'\u2014'}</span>
@@ -888,15 +782,9 @@ function buildCategoryTableRows(categories, columnOrder, onRowClick, groupPrefix
             } else {
               const ageGroup = showAdult ? 'adult' : 'u18'
               const diffClass = getDiffClass(ageGroup)
-              if (ageGroup === 'u18' && !hasAge) {
-                return (
-                  <td key={col} className={`${colIdx % 2 === 0 ? 'col-even' : 'col-odd'}${diffClass}`}>
-                    <span className="action-badge empty">{'\u2014'}</span>
-                  </td>
-                )
-              }
+              const isNonAgeSingle = !showAdult && entries && entries.length > 0 && !AGE_GROUP_TENANTS.has(entries[0].tenant_name)
               return (
-                <td key={col} className={`${colIdx % 2 === 0 ? 'col-even' : 'col-odd'}${diffClass}`}>
+                <td key={col} className={`${colIdx % 2 === 0 ? 'col-even' : 'col-odd'}${diffClass}${isNonAgeSingle ? ' non-age-tenant' : ''}`}>
                   {entries ? (
                     <ActionCell entries={entries} ageGroup={ageGroup} />
                   ) : (
@@ -915,7 +803,7 @@ function buildCategoryTableRows(categories, columnOrder, onRowClick, groupPrefix
 
 // --- Tenant Matrix (View 1) with categories + anchor groups ---
 
-function TenantMatrix({ rows, anchorTenant, onRowClick, columnOrder, dragProps, ageFilter = 'both' }) {
+function TenantMatrix({ rows, anchorTenant, onRowClick, columnOrder, dragProps, ageFilter = 'both', tenantLoadStatus }) {
   const { dragOverIdx, onDragStart, onDragOver, onDragLeave, onDrop } = dragProps
 
   const { anchorCategoriesRaw, nonAnchorCategoriesRaw, anchorCount, nonAnchorCount, allCatNames } = useMemo(() => {
@@ -1036,6 +924,10 @@ function TenantMatrix({ rows, anchorTenant, onRowClick, columnOrder, dragProps, 
                 onDrop={() => onDrop(colIdx)}
               >
                 <span className="grip-icon" />{shortTenant(t)}
+                {tenantLoadStatus && tenantLoadStatus.size > 0 && (() => {
+                  const status = tenantLoadStatus.get(TENANT_NAME_TO_ID[t])
+                  return status && status !== 'done' ? <span className={`tenant-status-icon header-icon ${status}`} /> : null
+                })()}
               </th>
             )
           }
@@ -1051,6 +943,10 @@ function TenantMatrix({ rows, anchorTenant, onRowClick, columnOrder, dragProps, 
               onDrop={() => onDrop(colIdx)}
             >
               <span className="grip-icon" />{shortTenant(t)}{suffix}
+              {tenantLoadStatus && tenantLoadStatus.size > 0 && (() => {
+                const status = tenantLoadStatus.get(TENANT_NAME_TO_ID[t])
+                return status && status !== 'done' ? <span className={`tenant-status-icon header-icon ${status}`} /> : null
+              })()}
             </th>
           )
         })}
@@ -1247,7 +1143,6 @@ function RegionMatrix({ rows, regions, selectedTenant, onRowClick, showDiffOnly,
       showDiffOnly,
     },
     ageFilter,
-    selectedTenantForRegion: selectedTenant,
   })
 
   return (
@@ -1375,15 +1270,16 @@ function CookiePrompt({ error, onSubmit, savedCookie }) {
 export default function App() {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(false)
-  const [loadPhase, setLoadPhase] = useState('')  // 'lists' | 'details' | ''
+  const [loadPhase, setLoadPhase] = useState('')  // 'lists' | 'details' | 'regions' | ''
   const [loadProgress, setLoadProgress] = useState({ done: 0, total: 0 })
+  const [tenantLoadStatus, setTenantLoadStatus] = useState(new Map()) // tenantId → 'queued' | 'loading' | 'done'
   const [lastFetched, setLastFetched] = useState(null)
   const [error, setError] = useState(null)
   const [activeTab, setActiveTab] = useState('tenant')
   const [search, setSearch] = useState('')
   const [categoryFilter, setCategoryFilter] = useState('')
   const [multiTenantOnly, setMultiTenantOnly] = useState(false)
-  const [mainVerticalsOnly, setMainVerticalsOnly] = useState(false)
+  const [mainVerticalsOnly, setMainVerticalsOnly] = useState(true)
   const [selectedTenant, setSelectedTenant] = useState('TikTok-Video-ContentClassification')
   const [anchorTenant, setAnchorTenant] = useState('TikTok-Video-ContentClassification')
   const [modalData, setModalData] = useState(null)
@@ -1396,6 +1292,8 @@ export default function App() {
 
   const fetchAbortRef = useRef(null)
   const dataRef = useRef([])
+  const [loadTooltip, setLoadTooltip] = useState(null) // { top, right } or null
+  const progressRef = useRef(null)
 
   const loadData = useCallback(async (cookieOverride) => {
     const activeCookie = cookieOverride !== undefined ? cookieOverride : cookie
@@ -1415,7 +1313,8 @@ export default function App() {
 
     // Try IndexedDB cache first
     const cached = await getCachedData()
-    if (cached && cached.entries && cached.entries.length > 0) {
+    const hasCachedData = cached && cached.entries && cached.entries.length > 0
+    if (hasCachedData) {
       setData(cached.entries)
       setLastFetched(cached.timestamp ? new Date(cached.timestamp) : null)
       setIsRefreshing(true)
@@ -1443,113 +1342,197 @@ export default function App() {
 
       if (thisRun.aborted) return
 
-      // Build a flat list of (tenantId, tenantName, listItem) to fetch details for
-      const detailTasks = []
+      // Build per-tenant task lists, ordered by tenant priority
+      const TENANT_PRIORITY = [62, 65, 45, 36, 84, 119, 10, 47, 118, 55, 72]
+      const SKIP_TITLE_RE = /test|deprecate|not in use/i
+      const mainTasksByTenant = new Map()
+      const otherTasksByTenant = new Map()
 
       for (const result of listResults) {
         if (!result) continue
         const { tenantId, items } = result
         const tenantName = TENANT_MAP[tenantId]
+        const mainTasks = []
+        const otherTasks = []
         for (const item of items) {
           if (!item.regionPolicyID) continue
-          detailTasks.push({
+          if (SKIP_TITLE_RE.test(item.title || '')) continue
+          const task = {
             tenantId,
             tenantName,
             listItem: item,
             regionPolicyID: item.regionPolicyID,
-          })
+          }
+          const cat0 = item.categoryCodes?.[0] || ''
+          if (MAIN_VERTICAL_CATEGORIES.has(cat0)) {
+            mainTasks.push(task)
+          } else {
+            otherTasks.push(task)
+          }
         }
+        if (mainTasks.length > 0) mainTasksByTenant.set(tenantId, mainTasks)
+        if (otherTasks.length > 0) otherTasksByTenant.set(tenantId, otherTasks)
+      }
+
+      // Order tenants by priority
+      const orderedTenantIds = TENANT_PRIORITY.filter(id => mainTasksByTenant.has(id) || otherTasksByTenant.has(id))
+      const allTenantIds = new Set([...mainTasksByTenant.keys(), ...otherTasksByTenant.keys()])
+      for (const id of allTenantIds) {
+        if (!orderedTenantIds.includes(id)) orderedTenantIds.push(id)
       }
 
       if (thisRun.aborted) return
-
-      // Phase 1.5: Discover RPF regional API (try once with first RPF policy)
-      setLoadPhase('discovering')
-      const sampleRPF = detailTasks.find(t => t.listItem.isRPF)
-      if (sampleRPF) {
-        console.log('[RPF] Discovering regional API using sample policy:', sampleRPF.listItem.uid, sampleRPF.listItem.title)
-        await discoverRPFApi(sampleRPF.listItem.uid, sampleRPF.regionPolicyID, sampleRPF.tenantId, activeCookie)
-      }
-
-      if (thisRun.aborted) return
-
-      // Phase 2: Fetch details with concurrency limit
-      setLoadPhase('details')
-      setLoadProgress({ done: 0, total: detailTasks.length })
 
       // Deduplicate detail fetches by regionPolicyID (cache detail results)
       const detailFetchCache = new Map()
-      const rpfCache = new Map()
-
-      // Reset dataRef for progressive flush
-      dataRef.current = []
-      let entryId = 0
-      let lastFlush = 0
-
-      // Log region distribution for debugging
       const regionCounts = {}
 
-      await batchFetch(
-        detailTasks,
-        async (task) => {
-          let entries
+      // Progressive flush: fresh entries replace their cached counterparts,
+      // all other cached entries stay visible until their tenant refreshes.
+      const cachedBase = hasCachedData ? [...cached.entries] : []
+      const freshEntries = []
+      const freshKeys = new Set()
+      let entryId = 0
 
-          // For RPF policies, try the RPF regional API first
-          if (task.listItem.isRPF && _rpfApiEndpoint) {
-            const rpfCacheKey = `${task.tenantId}:${task.listItem.uid}`
-            if (!rpfCache.has(rpfCacheKey)) {
-              const rpfResult = await fetchRPFRegions(task.listItem.uid, task.regionPolicyID, task.tenantId, activeCookie)
-              rpfCache.set(rpfCacheKey, rpfResult)
-            }
-            const rpfData = rpfCache.get(rpfCacheKey)
-            if (rpfData?.data) {
-              entries = transformRPFRegionsToEntries(rpfData.data, task.tenantId, task.tenantName, task.listItem)
-              if (entries.length > 0) {
-                for (const e of entries) {
-                  e.id = entryId++
-                  regionCounts[e.region] = (regionCounts[e.region] || 0) + 1
-                }
-                dataRef.current.push(...entries)
-                return entries
-              }
-            }
+      const addFresh = (entries) => {
+        for (const e of entries) {
+          freshKeys.add(`${e.tenant_id}\t${e.policy_title}\t${e.region}`)
+        }
+        freshEntries.push(...entries)
+      }
+
+      const flushMerged = () => {
+        const kept = cachedBase.filter(e =>
+          !freshKeys.has(`${e.tenant_id}\t${e.policy_title}\t${e.region}`)
+        )
+        const merged = [...kept, ...freshEntries]
+        dataRef.current = merged
+        setData(merged)
+      }
+
+      // Helper: fetch detail for a single task, return entries (General only or all regions)
+      const fetchTaskDetail = async (task, generalOnly) => {
+        let detailData
+        const cacheKey = `${task.tenantId}:${task.regionPolicyID}`
+        if (detailFetchCache.has(cacheKey)) {
+          detailData = detailFetchCache.get(cacheKey)
+        } else {
+          detailData = await fetchPolicyDetail(task.regionPolicyID, task.tenantId, activeCookie)
+          detailFetchCache.set(cacheKey, detailData)
+        }
+        let entries = transformDetailToEntries(detailData, task.tenantId, task.tenantName, task.listItem)
+        if (generalOnly) {
+          entries = entries.filter(e => e.region === 'General')
+        }
+        for (const e of entries) {
+          e.id = entryId++
+          regionCounts[e.region] = (regionCounts[e.region] || 0) + 1
+        }
+        return entries
+      }
+
+      // Count total policies across all phases
+      const mainTotal = orderedTenantIds.reduce((sum, id) => sum + (mainTasksByTenant.get(id)?.length || 0), 0)
+      const otherTotal = orderedTenantIds.reduce((sum, id) => sum + (otherTasksByTenant.get(id)?.length || 0), 0)
+      const allTotal = mainTotal + otherTotal
+
+      // Initialize per-tenant load status
+      const statusMap = new Map()
+      for (const id of orderedTenantIds) statusMap.set(id, 'queued')
+      setTenantLoadStatus(new Map(statusMap))
+
+      const markTenant = (id, status) => {
+        statusMap.set(id, status)
+        setTenantLoadStatus(new Map(statusMap))
+      }
+
+      // Phase 2: Fetch General region per tenant — main verticals first, then others
+      // Uses concurrency of 50 (HTTP/2 multiplexing) and processes tenants in parallel batches
+      setLoadPhase('details')
+      let totalDone = 0
+      setLoadProgress({ done: 0, total: allTotal })
+
+      const TENANT_CONCURRENCY = 3 // Load up to 3 tenants simultaneously
+      const FETCH_CONCURRENCY = 50 // Per-tenant HTTP concurrency
+
+      const loadTenantGeneral = async (tenantId) => {
+        if (thisRun.aborted) return
+        // Main verticals first, then others — order matters for progressive display
+        const tasks = [
+          ...(mainTasksByTenant.get(tenantId) || []),
+          ...(otherTasksByTenant.get(tenantId) || []),
+        ]
+        if (tasks.length === 0) {
+          markTenant(tenantId, 'done')
+          return
+        }
+
+        markTenant(tenantId, 'loading')
+
+        await batchFetch(
+          tasks,
+          async (task) => {
+            const entries = await fetchTaskDetail(task, true) // General only
+            addFresh(entries)
+            return entries
+          },
+          FETCH_CONCURRENCY,
+          (done) => {
+            if (thisRun.aborted) return
+            totalDone++
+            setLoadProgress({ done: totalDone, total: allTotal })
           }
+        )
 
-          // Fallback: use the standard detail API
-          let detailData
+        markTenant(tenantId, 'done')
+        if (thisRun.aborted) return
+
+        flushMerged()
+      }
+
+      // Process tenants in parallel batches of TENANT_CONCURRENCY
+      for (let i = 0; i < orderedTenantIds.length; i += TENANT_CONCURRENCY) {
+        if (thisRun.aborted) return
+        const batch = orderedTenantIds.slice(i, i + TENANT_CONCURRENCY)
+        await Promise.all(batch.map(id => loadTenantGeneral(id)))
+      }
+
+      if (thisRun.aborted) return
+
+      // Phase 2b: Extract non-General regions from already-cached detail data (synchronous — no network)
+      setLoadPhase('regions')
+      setLoadProgress({ done: 0, total: allTotal })
+
+      let regionDone = 0
+      for (const tenantId of orderedTenantIds) {
+        if (thisRun.aborted) return
+        const tasks = [
+          ...(mainTasksByTenant.get(tenantId) || []),
+          ...(otherTasksByTenant.get(tenantId) || []),
+        ]
+        for (const task of tasks) {
           const cacheKey = `${task.tenantId}:${task.regionPolicyID}`
-          if (detailFetchCache.has(cacheKey)) {
-            detailData = detailFetchCache.get(cacheKey)
-          } else {
-            detailData = await fetchPolicyDetail(task.regionPolicyID, task.tenantId, activeCookie)
-            detailFetchCache.set(cacheKey, detailData)
-          }
-          entries = transformDetailToEntries(detailData, task.tenantId, task.tenantName, task.listItem)
+          const detailData = detailFetchCache.get(cacheKey)
+          if (!detailData) continue
+          let entries = transformDetailToEntries(detailData, task.tenantId, task.tenantName, task.listItem)
+          entries = entries.filter(e => e.region !== 'General')
           for (const e of entries) {
             e.id = entryId++
             regionCounts[e.region] = (regionCounts[e.region] || 0) + 1
           }
-          dataRef.current.push(...entries)
-          return entries
-        },
-        20,  // 20 concurrent requests
-        (done, total) => {
-          if (thisRun.aborted) return
-          setLoadProgress({ done, total })
-          // Progressive flush: every ~50 completions, push partial data to UI
-          if (done - lastFlush >= 50) {
-            lastFlush = done
-            setData([...dataRef.current])
-          }
+          addFresh(entries)
         }
-      )
+        regionDone += tasks.length
+        setLoadProgress({ done: regionDone, total: allTotal })
+      }
+
+      // Final flush with all regions
+      flushMerged()
 
       if (thisRun.aborted) return
 
-      console.log('[Data] Region distribution:', regionCounts)
-
       const allEntries = dataRef.current
-
+      console.log('[Data] Region distribution:', regionCounts)
       console.log(`[Data] Total entries: ${allEntries.length}, Unique regions: ${[...new Set(allEntries.map(e => e.region))].join(', ')}`)
 
       setData(allEntries)
@@ -1745,12 +1728,8 @@ export default function App() {
       ? Math.round((loadProgress.done / loadProgress.total) * 100)
       : 0
     const phaseLabel = loadPhase === 'lists'
-      ? `Loading policies... ${loadProgress.done}/${loadProgress.total} tenants`
-      : loadPhase === 'discovering'
-        ? 'Discovering regional APIs...'
-        : loadPhase === 'details'
-          ? `Loading details... ${loadProgress.done}/${loadProgress.total} policies`
-          : 'Initializing...'
+      ? `Loading policy lists\u2026 ${loadProgress.done}/${loadProgress.total} tenants`
+      : loadPhase ? `Loading ${loadPhase}\u2026` : 'Initializing\u2026'
 
     return (
       <div className="loading-overlay">
@@ -1760,6 +1739,16 @@ export default function App() {
           <div className="progress-bar-fill" style={{ width: `${pct}%` }} />
         </div>
         <div className="loading-text">{pct}%</div>
+        {tenantLoadStatus.size > 0 && (
+          <div className="tenant-checklist">
+            {[...tenantLoadStatus.entries()].map(([id, status]) => (
+              <div key={id} className={`tenant-checklist-item ${status}`}>
+                <span className={`tenant-status-icon ${status}`} />
+                <span>{shortTenant(TENANT_MAP[id])}</span>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     )
   }
@@ -1818,19 +1807,30 @@ export default function App() {
                 <span>
                   {loadPhase === 'lists'
                     ? `Fetching policy lists\u2026 ${loadProgress.done}/${loadProgress.total} tenants`
-                    : loadPhase === 'discovering'
-                      ? 'Discovering regional APIs\u2026'
-                      : loadPhase === 'details'
-                        ? `Loading latest data\u2026 ${loadProgress.done} / ${loadProgress.total} policies`
-                        : 'Refreshing\u2026'}
+                    : loadPhase ? `Loading ${loadPhase}\u2026` : 'Refreshing\u2026'}
                 </span>
-                <span className="refresh-callout-hint">Data will update once completed.</span>
+                <span className="refresh-callout-pct">
+                  {loadProgress.total > 0 ? Math.round((loadProgress.done / loadProgress.total) * 100) : 0}%
+                </span>
+                <span
+                  className="refresh-info-icon"
+                  ref={progressRef}
+                  onMouseEnter={() => {
+                    if (progressRef.current) {
+                      const rect = progressRef.current.getBoundingClientRect()
+                      setLoadTooltip({ top: rect.bottom + 6, right: window.innerWidth - rect.right - rect.width / 2 })
+                    }
+                  }}
+                  onMouseLeave={() => setLoadTooltip(null)}
+                >i</span>
               </div>
-              <div className="refresh-callout-bar-track">
-                <div
-                  className="refresh-callout-bar-fill"
-                  style={{ width: `${loadProgress.total > 0 ? Math.round((loadProgress.done / loadProgress.total) * 100) : 0}%` }}
-                />
+              <div className="refresh-callout-progress">
+                <div className="refresh-callout-bar-track">
+                  <div
+                    className="refresh-callout-bar-fill"
+                    style={{ width: `${loadProgress.total > 0 ? Math.round((loadProgress.done / loadProgress.total) * 100) : 0}%` }}
+                  />
+                </div>
               </div>
             </div>
           )}
@@ -1953,6 +1953,7 @@ export default function App() {
           columnOrder={dragProps.columnOrder}
           dragProps={dragProps}
           ageFilter={ageFilter}
+          tenantLoadStatus={tenantLoadStatus}
         />
       ) : (
         <RegionMatrix
@@ -1979,6 +1980,17 @@ export default function App() {
           entries={modalData.entries}
           onClose={closeModal}
         />
+      )}
+      {loadTooltip && tenantLoadStatus.size > 0 && createPortal(
+        <div className="refresh-tooltip" style={{ top: loadTooltip.top, right: loadTooltip.right }}>
+          {[...tenantLoadStatus.entries()].map(([id, status]) => (
+            <div key={id} className={`tenant-checklist-item ${status}`}>
+              <span className={`tenant-status-icon ${status}`} />
+              <span>{shortTenant(TENANT_MAP[id])}</span>
+            </div>
+          ))}
+        </div>,
+        document.body
       )}
     </div>
   )
