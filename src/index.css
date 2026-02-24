@@ -11,6 +11,7 @@
   --radius: 6px;
   --navbar-bg: #1a1a2e;
   --navbar-height: 48px;
+  --header-row-height: 34px;
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -308,6 +309,23 @@ body {
   border-width: 0 1.5px 1.5px 0;
 }
 
+/* Section headers for dual-phase tooltip / checklist */
+.tooltip-section-header {
+  font-size: 0.6rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  padding-bottom: 0.2rem;
+  margin-bottom: 0.15rem;
+  margin-top: 0.35rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.tooltip-section-header:first-child {
+  margin-top: 0;
+}
+
 /* ===== Filter Bar (restyled toolbar) ===== */
 .toolbar {
   position: sticky;
@@ -347,14 +365,6 @@ body {
   color: var(--text);
   white-space: nowrap;
   margin-right: 0.5rem;
-}
-
-.toolbar-title {
-  font-size: 1rem;
-  font-weight: 700;
-  color: var(--text);
-  white-space: nowrap;
-  margin-right: 0.25rem;
 }
 
 /* Segmented tab control */
@@ -800,12 +810,24 @@ body {
   letter-spacing: 0.01em;
   color: var(--text);
   padding: 0.55rem 0.6rem;
+  height: var(--header-row-height);
   border-bottom: 1px solid var(--border);
   white-space: nowrap;
   cursor: grab;
   user-select: none;
   transition: background 0.1s;
   background: #dbeafe;
+}
+
+/* First header row: explicit top for proper stacking with rowSpan */
+.matrix-table thead tr:first-child th {
+  top: 0 !important;
+  z-index: 11;
+}
+
+/* Ensure first row has a fixed height so second row offset is accurate */
+.matrix-table thead tr:first-child {
+  height: var(--header-row-height);
 }
 
 .matrix-table thead th:active {
@@ -1317,42 +1339,38 @@ body {
   transition: width 0.2s ease;
 }
 
-/* Refresh button (legacy, kept for toolbar usage if needed) */
-.refresh-btn {
-  padding: 0.3rem 0.55rem;
-  font-size: 1rem;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  background: var(--bg);
-  color: var(--text);
-  cursor: pointer;
-  line-height: 1;
-  transition: background 0.15s, color 0.15s;
-  flex-shrink: 0;
-}
-
-.refresh-btn:hover {
-  background: #edf0ff;
-  color: var(--primary);
-}
-
-/* Last fetched timestamp */
-.last-fetched {
-  font-size: 0.68rem;
-  color: var(--text-muted);
-  white-space: nowrap;
-  flex-shrink: 0;
-}
-
 /* ===== Sub-column styles for 18+ / U18 headers ===== */
 .sub-col-parent {
   border-bottom: 1px solid var(--border) !important;
 }
 
-.sub-col-header-row th {
-  position: sticky;
-  top: 28px;
+.matrix-table thead .sub-col-header-row th {
+  top: var(--header-row-height) !important;
   z-index: 9;
+}
+
+
+/* Spacer cells in sub-header row (replace rowSpan for sticky compat) */
+.sub-col-spacer {
+  padding: 0 !important;
+  height: 0 !important;
+  line-height: 0 !important;
+  font-size: 0 !important;
+  border-bottom: 1px solid var(--border) !important;
+  background: #dbeafe !important;
+}
+
+/* Sticky left positioning for spacer cells in has-categories tables */
+.matrix-table.has-categories .sub-col-header-row th:first-child {
+  position: sticky;
+  left: 0;
+  z-index: 15;
+}
+
+.matrix-table.has-categories .sub-col-header-row th:nth-child(2) {
+  position: sticky;
+  left: 32px;
+  z-index: 15;
 }
 
 .sub-col-label {

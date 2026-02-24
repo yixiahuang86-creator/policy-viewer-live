@@ -1,7 +1,27 @@
+/**
+ * Policy Viewer (Live) — Main Application
+ *
+ * Architecture overview:
+ * 1. Data is fetched from PMS APIs in three progressive phases:
+ *    Phase 1 (lists)   — Fetch policy search results for all 11 tenants in parallel
+ *    Phase 2 (details) — Fetch General-region detail per policy, tenant-by-tenant with progress
+ *    Phase 3 (regions) — Fetch region lists and clone General data for non-General regions
+ * 2. Data is cached in IndexedDB; on reload, cached data is shown immediately while
+ *    a background refresh runs. Fresh entries progressively replace cached ones.
+ * 3. Two views: "Features" (tenant×policy matrix) and "Regions" (region×policy matrix)
+ * 4. Policies are fuzzy-grouped by title similarity (Jaccard on word tokens, ≥0.75 threshold)
+ *
+ * Key state: `data` holds the flat array of policy entries used by both views.
+ * During loading, `tenantLoadStatus` and `regionLoadStatus` Maps track per-tenant progress.
+ */
 import { useState, useEffect, useMemo, useCallback, useRef, Fragment } from 'react'
 import { createPortal } from 'react-dom'
 
-// --- Tenant ID → Name mapping ---
+// ============================================================================
+// CONSTANTS — Tenant definitions, category lists, display mappings
+// ============================================================================
+
+/** Canonical mapping of tenant IDs to their full API names */
 const TENANT_MAP = {
   62: 'TikTok-Video-ContentClassification',
   65: 'Live-Livestream-General',
@@ -16,11 +36,19 @@ const TENANT_MAP = {
   10: 'M&T-Audio-General',
 }
 
+/** All tenant IDs as numbers, derived from TENANT_MAP keys */
 const TENANT_IDS = Object.keys(TENANT_MAP).map(Number)
+/** Reverse lookup: tenant name → numeric ID (used for header status icons) */
 const TENANT_NAME_TO_ID = Object.fromEntries(Object.entries(TENANT_MAP).map(([id, name]) => [name, Number(id)]))
 
-// --- IndexedDB Cache Layer ---
+// ============================================================================
+// PERSISTENCE — IndexedDB cache, localStorage for cookie & favourite tenant
+// ============================================================================
 
+/**
+ * IndexedDB cache stores the full entries array + timestamp under key 'entries'.
+ * This allows instant display on page load while a background refresh runs.
+ */
 function openCacheDB() {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open('pms-cache', 1)
@@ -50,7 +78,7 @@ async function setCachedData(entries) {
   } catch { /* ignore */ }
 }
 
-// --- Cookie storage key ---
+/** Session cookie persisted in localStorage so users don't re-enter it on reload */
 const COOKIE_STORAGE_KEY = 'pms_session_cookie'
 
 function getSavedCookie() {
@@ -61,8 +89,33 @@ function saveCookie(cookie) {
   try { localStorage.setItem(COOKIE_STORAGE_KEY, cookie) } catch { /* ignore */ }
 }
 
-// --- API fetch helpers ---
+/** Favourite tenant: loads first during refresh. Persisted in localStorage. */
+const FAVOURITE_TENANT_KEY = 'pms_favourite_tenant'
 
+function getSavedFavouriteTenant() {
+  try {
+    const val = localStorage.getItem(FAVOURITE_TENANT_KEY)
+    if (val == null) return null
+    const num = Number(val)
+    return Number.isFinite(num) ? num : null
+  } catch { return null }
+}
+
+function saveFavouriteTenant(tenantId) {
+  try {
+    if (tenantId == null || tenantId === '') {
+      localStorage.removeItem(FAVOURITE_TENANT_KEY)
+    } else {
+      localStorage.setItem(FAVOURITE_TENANT_KEY, String(tenantId))
+    }
+  } catch { /* ignore */ }
+}
+
+// ============================================================================
+// API FETCH HELPERS — All PMS API calls, with auth error propagation
+// ============================================================================
+
+/** Phase 1: Fetch the full policy list for a single tenant via search API */
 async function fetchTenantList(tenantId, cookie) {
   const headers = {
     'Content-Type': 'application/json',
@@ -77,25 +130,42 @@ async function fetchTenantList(tenantId, cookie) {
       returnConfig: { page: 1, limit: 99999, highLightConfig: { fragmentSize: 200 } },
     }),
   })
+  if (res.status === 401 || res.status === 403) throw new Error('AUTH_REQUIRED')
   if (!res.ok) throw new Error(`List API failed for tenant ${tenantId}: ${res.status}`)
   const json = await res.json()
   if (json.code === 401) throw new Error('AUTH_REQUIRED')
   return json.data?.data || []
 }
 
+/** Phase 2: Fetch detailed region policy data (contains per-region action results) */
 async function fetchPolicyDetail(regionPolicyID, tenantId, cookie) {
   const headers = { 'Tenant': String(tenantId) }
   if (cookie) headers['X-PMS-Cookie'] = cookie
   const res = await fetch(`/api/cms/v3/policy/get_region_policy_by_id?id=${regionPolicyID}&languageCodes=en`, { headers })
+  if (res.status === 401 || res.status === 403) throw new Error('AUTH_REQUIRED')
   if (!res.ok) throw new Error(`Detail API failed for ${regionPolicyID}: ${res.status}`)
   const json = await res.json()
   if (json.code === 401) throw new Error('AUTH_REQUIRED')
   return json.data || {}
 }
 
-// --- Transform detail response → flat entries matching current format ---
+/** Phase 3 Step 1: Fetch the list of regions a policy is published in */
+async function fetchPolicyRegionList(uid, tenantId, cookie) {
+  const headers = { 'Tenant': String(tenantId) }
+  if (cookie) headers['X-PMS-Cookie'] = cookie
+  const res = await fetch(`/api/cms/v3/policy/get_policy_region_list?uid=${uid}`, { headers })
+  if (res.status === 401 || res.status === 403) throw new Error('AUTH_REQUIRED')
+  if (!res.ok) throw new Error(`Region list API failed for ${uid}: ${res.status}`)
+  const json = await res.json()
+  if (json.code === 401) throw new Error('AUTH_REQUIRED')
+  return json.data
+}
 
-// Parse a results value that may be a JSON string, object, or null
+// ============================================================================
+// DATA TRANSFORMS — Convert API responses into flat entry objects
+// ============================================================================
+
+/** Parse a `results` field that may be a JSON string, object, or null */
 function parseResults(val) {
   if (!val) return null
   if (typeof val === 'object') return Object.keys(val).length > 0 ? val : null
@@ -108,6 +178,11 @@ function parseResults(val) {
   return null
 }
 
+/**
+ * Transform a detail API response into flat entry objects.
+ * Each region in the response becomes a separate entry with resolved action fields.
+ * Priority for results: condition_results → regionData.results → listItem.results
+ */
 function transformDetailToEntries(detailData, tenantId, tenantName, listItem) {
   const entries = []
   const regions = detailData.regions || {}
@@ -148,8 +223,11 @@ function transformDetailToEntries(detailData, tenantId, tenantName, listItem) {
   return entries
 }
 
-// --- Batch concurrent requests with concurrency limit ---
-
+/**
+ * Generic concurrency-limited batch fetcher using a worker pool pattern.
+ * Workers pull from a shared index. AUTH_REQUIRED errors are re-thrown immediately.
+ * Returns an array parallel to `items` (null for failed items).
+ */
 async function batchFetch(items, fn, concurrency, onProgress) {
   const results = []
   let completed = 0
@@ -161,6 +239,7 @@ async function batchFetch(items, fn, concurrency, onProgress) {
       try {
         results[i] = await fn(items[i], i)
       } catch (err) {
+        if (err.message === 'AUTH_REQUIRED') throw err
         console.warn('Batch fetch error:', err)
         results[i] = null
       }
@@ -174,8 +253,13 @@ async function batchFetch(items, fn, concurrency, onProgress) {
   return results
 }
 
-// --- Fuzzy title grouping utilities (preserved) ---
+// ============================================================================
+// FUZZY TITLE GROUPING — Merge near-duplicate policy titles across tenants
+// Uses Jaccard similarity (≥0.75) on word tokens with Union-Find clustering.
+// Borderline-labelled entries are kept separate from their non-borderline siblings.
+// ============================================================================
 
+/** Strip bracketed tags and normalize whitespace for comparison */
 function normalizeForGrouping(title) {
   let norm = title.replace(/\[.*?\]/g, '').trim()
   norm = norm.toLowerCase().replace(/\s+/g, ' ').trim()
@@ -199,6 +283,11 @@ function isBorderline(entry) {
   return (entry.labels || []).some(l => l.toLowerCase().includes('borderline'))
 }
 
+/**
+ * Build fuzzy groups from all entries.
+ * Algorithm: normalize titles → blocking by shared tokens → pairwise Jaccard →
+ * Union-Find merge → pick most frequent title as group label.
+ */
 function buildFuzzyGroups(data) {
   const normMap = new Map()
   for (const entry of data) {
@@ -272,8 +361,11 @@ function buildFuzzyGroups(data) {
   return result
 }
 
-// --- Action display helpers (updated colour groupings) ---
+// ============================================================================
+// ACTION DISPLAY HELPERS — Classify, abbreviate, and colour-code policy actions
+// ============================================================================
 
+/** Map an action string to a CSS class for colour coding */
 function actionClass(val) {
   if (!val) return 'empty'
   const lower = val.toLowerCase()
@@ -285,6 +377,7 @@ function actionClass(val) {
   return ''
 }
 
+/** Abbreviate an action string for compact matrix cell display */
 function actionShort(val) {
   if (!val) return '\u2014'
   const lower = val.toLowerCase()
@@ -363,13 +456,11 @@ const MAIN_VERTICAL_ORDER = [
 ]
 const MAIN_VERTICAL_CATEGORIES = new Set(MAIN_VERTICAL_ORDER)
 
-// --- New helpers ---
-
-// #7: For Video-ContentClassification use adult_action; for others use fallback chain
+/**
+ * Get the primary (adult/default) action for a policy entry.
+ * Fallback chain: adult_action → results.Action → tenant-specific fields → nested Action keys.
+ */
 function getPrimaryAction(entry) {
-  if (entry.tenant_name === 'TikTok-Video-ContentClassification') {
-    if (entry.adult_action) return entry.adult_action
-  }
   if (entry.adult_action) return entry.adult_action
   const r = entry.results
   if (!r) return ''
@@ -390,10 +481,10 @@ function getPrimaryAction(entry) {
   return ''
 }
 
-
-// Tenants that have age-specific fields (adult_action, children_action)
+/** Tenants that have age-specific action fields (adult_action, children_action) */
 const AGE_GROUP_TENANTS = new Set(['TikTok-Video-ContentClassification', 'PhotoPost'])
 
+/** Get the U18 (children) action; for non-age tenants, same as primary */
 function getU18Action(entry) {
   if (AGE_GROUP_TENANTS.has(entry.tenant_name)) {
     return entry.children_action || ''
@@ -401,7 +492,7 @@ function getU18Action(entry) {
   return getPrimaryAction(entry) // Non-age tenants: same as adult
 }
 
-// Severity ranking: higher = more severe
+/** Numeric severity ranking for actions (higher = more severe). Used to pick the worst action in a cell. */
 function getActionSeverity(val) {
   if (!val) return 0
   const lower = val.toLowerCase()
@@ -415,6 +506,7 @@ function getActionSeverity(val) {
   return 10
 }
 
+/** Pick the most severe action from a list of entries for a given age group */
 function getCellAction(entries, ageGroup = 'adult') {
   if (!entries || entries.length === 0) return ''
   const getAction = ageGroup === 'u18'
@@ -434,7 +526,11 @@ function getCellAction(entries, ageGroup = 'adult') {
   return mostSevere
 }
 
-// Render a results object (flat or nested) for display in modal
+// ============================================================================
+// PRESENTATIONAL COMPONENTS — Badges, cells, modals, navigation
+// ============================================================================
+
+/** Render a results object (flat or nested) as a readable summary in the detail modal */
 function ResultSummary({ results }) {
   if (!results || Object.keys(results).length === 0) return <span className="action-badge empty">{'\u2014'}</span>
 
@@ -469,8 +565,7 @@ function ResultSummary({ results }) {
   )
 }
 
-// --- Modal component ---
-
+/** Generic modal dialog with Escape-to-close and backdrop click */
 function Modal({ title, onClose, children }) {
   useEffect(() => {
     const handler = (e) => { if (e.key === 'Escape') onClose() }
@@ -493,8 +588,7 @@ function Modal({ title, onClose, children }) {
   )
 }
 
-// --- Action Cell (single matrix cell) ---
-
+/** Single matrix cell: shows the most severe action badge + count if multiple entries */
 function ActionCell({ entries, ageGroup = 'adult' }) {
   const action = getCellAction(entries, ageGroup)
   const count = entries ? entries.length : 0
@@ -507,8 +601,7 @@ function ActionCell({ entries, ageGroup = 'adult' }) {
   )
 }
 
-// --- Tenant Detail Popup (View 1 drill-down) ---
-
+/** Detail modal for Features view: shows entries grouped by tenant */
 function TenantDetailPopup({ groupLabel, entries, onClose }) {
   const byTenant = useMemo(() => {
     const map = new Map()
@@ -551,8 +644,7 @@ function TenantDetailPopup({ groupLabel, entries, onClose }) {
   )
 }
 
-// --- Region Detail Popup (View 2 drill-down) ---
-
+/** Detail modal for Regions view: shows entries grouped by region */
 function RegionDetailPopup({ groupLabel, entries, onClose }) {
   const byRegion = useMemo(() => {
     const map = new Map()
@@ -603,8 +695,11 @@ function RegionDetailPopup({ groupLabel, entries, onClose }) {
   )
 }
 
-// --- Draggable header hook ---
+// ============================================================================
+// DRAG-AND-DROP — Column reordering for matrix headers and category sidebar
+// ============================================================================
 
+/** Hook for drag-to-reorder table columns. `pinnedCount` columns at the left cannot be moved. */
 function useDraggableColumns(initialOrder, pinnedCount = 0) {
   const [columnOrder, setColumnOrder] = useState(initialOrder)
   const dragIdx = useRef(null)
@@ -646,8 +741,7 @@ function useDraggableColumns(initialOrder, pinnedCount = 0) {
   return { columnOrder, dragOverIdx, draggingIdx: dragIdx, onDragStart, onDragOver, onDragLeave, onDrop }
 }
 
-// --- Category jump nav sidebar ---
-
+/** Left sidebar navigation: shows category list with drag-to-reorder and scroll-to on click */
 function CategoryJumpNav({ categories, activeCategory, groupPrefix, heading, onReorder }) {
   const dragIdx = useRef(null)
   const [dragOverIdx, setDragOverIdx] = useState(null)
@@ -712,8 +806,11 @@ function CategoryJumpNav({ categories, activeCategory, groupPrefix, heading, onR
   )
 }
 
-// --- Build flat table rows with category label cells ---
-
+/**
+ * Build flat <tr> elements for a categorised matrix table.
+ * Inserts category separator rows and handles dual age-column (18+/U18) layout.
+ * Used by both TenantMatrix and RegionMatrix.
+ */
 function buildCategoryTableRows(categories, columnOrder, onRowClick, groupPrefix, opts = {}) {
   const { getEntries = (row, col) => row.byTenant.get(col), diffConfig, ageFilter = 'both' } = opts
   const showAdult = ageFilter === 'both' || ageFilter === 'adult'
@@ -801,8 +898,15 @@ function buildCategoryTableRows(categories, columnOrder, onRowClick, groupPrefix
   return rows
 }
 
-// --- Tenant Matrix (View 1) with categories + anchor groups ---
+// ============================================================================
+// VIEW COMPONENTS — TenantMatrix (Features tab) and RegionMatrix (Regions tab)
+// ============================================================================
 
+/**
+ * Features view: policy × tenant matrix, split into "In anchor" and "Not in anchor" groups.
+ * Columns are tenant names; rows are fuzzy-grouped policies. Categories are sorted by
+ * Main Verticals priority. Supports drag-to-reorder columns and category sidebar.
+ */
 function TenantMatrix({ rows, anchorTenant, onRowClick, columnOrder, dragProps, ageFilter = 'both', tenantLoadStatus }) {
   const { dragOverIdx, onDragStart, onDragOver, onDragLeave, onDrop } = dragProps
 
@@ -907,8 +1011,8 @@ function TenantMatrix({ rows, anchorTenant, onRowClick, columnOrder, dragProps, 
   const renderHeader = () => (
     <thead>
       <tr>
-        <th rowSpan={showBothAge ? 2 : 1}>{/* category label column */}</th>
-        <th rowSpan={showBothAge ? 2 : 1}>Policy</th>
+        <th>{/* category label column */}</th>
+        <th>Policy</th>
         {columnOrder.map((t, i) => {
           const colIdx = i + 1
           if (showBothAge) {
@@ -953,6 +1057,8 @@ function TenantMatrix({ rows, anchorTenant, onRowClick, columnOrder, dragProps, 
       </tr>
       {showBothAge && (
         <tr className="sub-col-header-row">
+          <th className="sub-col-spacer">{/* category label spacer */}</th>
+          <th className="sub-col-spacer">{/* policy spacer */}</th>
           {columnOrder.map((t, i) => {
             const colIdx = i + 1
             return (
@@ -1028,7 +1134,7 @@ function TenantMatrix({ rows, anchorTenant, onRowClick, columnOrder, dragProps, 
   )
 }
 
-// Helper: group rows by primary category
+/** Group rows by their most common category (cat0). Returns sorted array of {name, rows}. */
 function groupByCategory(rows) {
   const map = new Map()
   for (const row of rows) {
@@ -1050,8 +1156,11 @@ function groupByCategory(rows) {
     }))
 }
 
-// --- Region Matrix (View 2) ---
-
+/**
+ * Regions view: policy × region matrix for a single tenant.
+ * "General" column is pinned first; diff highlighting shows where regional actions
+ * diverge from General. Supports drag-to-reorder and category sidebar.
+ */
 function RegionMatrix({ rows, regions, selectedTenant, onRowClick, showDiffOnly, ageFilter = 'both' }) {
   const defaultRegionOrder = useMemo(() => {
     const hasGeneral = regions.includes('General')
@@ -1163,8 +1272,8 @@ function RegionMatrix({ rows, regions, selectedTenant, onRowClick, showDiffOnly,
         <table className="matrix-table has-categories">
           <thead>
             <tr>
-              <th rowSpan={regionShowBoth ? 2 : 1}>{/* category label column */}</th>
-              <th rowSpan={regionShowBoth ? 2 : 1}>Policy</th>
+              <th>{/* category label column */}</th>
+              <th>Policy</th>
               {columnOrder.map((r, i) => {
                 const colIdx = i + 1
                 const isPinned = colIdx === 1
@@ -1202,6 +1311,8 @@ function RegionMatrix({ rows, regions, selectedTenant, onRowClick, showDiffOnly,
             </tr>
             {regionShowBoth && (
               <tr className="sub-col-header-row">
+                <th className="sub-col-spacer">{/* category label spacer */}</th>
+                <th className="sub-col-spacer">{/* policy spacer */}</th>
                 {columnOrder.map((r, i) => {
                   const colIdx = i + 1
                   return (
@@ -1221,8 +1332,7 @@ function RegionMatrix({ rows, regions, selectedTenant, onRowClick, showDiffOnly,
   )
 }
 
-// --- Cookie prompt screen ---
-
+/** Authentication screen: prompts user to paste their PMS session cookie */
 function CookiePrompt({ error, onSubmit, savedCookie }) {
   const [input, setInput] = useState(savedCookie || '')
 
@@ -1265,14 +1375,18 @@ function CookiePrompt({ error, onSubmit, savedCookie }) {
   )
 }
 
-// --- App ---
+// ============================================================================
+// APP — Root component: data fetching, state management, and layout
+// ============================================================================
 
 export default function App() {
-  const [data, setData] = useState(null)
-  const [loading, setLoading] = useState(false)
-  const [loadPhase, setLoadPhase] = useState('')  // 'lists' | 'details' | 'regions' | ''
+  // --- Core data state ---
+  const [data, setData] = useState(null)              // Flat array of all policy entries
+  const [loading, setLoading] = useState(false)        // True during first load (no cached data)
+  const [loadPhase, setLoadPhase] = useState('')       // 'lists' | 'details' | 'regions' | ''
   const [loadProgress, setLoadProgress] = useState({ done: 0, total: 0 })
-  const [tenantLoadStatus, setTenantLoadStatus] = useState(new Map()) // tenantId → 'queued' | 'loading' | 'done'
+  const [tenantLoadStatus, setTenantLoadStatus] = useState(new Map())  // Phase 2 per-tenant progress
+  const [regionLoadStatus, setRegionLoadStatus] = useState(new Map())  // Phase 3 per-tenant progress
   const [lastFetched, setLastFetched] = useState(null)
   const [error, setError] = useState(null)
   const [activeTab, setActiveTab] = useState('tenant')
@@ -1289,6 +1403,7 @@ export default function App() {
   const [isRefreshing, setIsRefreshing] = useState(false)
   const [cookie, setCookie] = useState(getSavedCookie)
   const [needsAuth, setNeedsAuth] = useState(!getSavedCookie())
+  const [favouriteTenant, setFavouriteTenant] = useState(getSavedFavouriteTenant)
 
   const fetchAbortRef = useRef(null)
   const dataRef = useRef([])
@@ -1326,6 +1441,14 @@ export default function App() {
     setLoadPhase('lists')
     setLoadProgress({ done: 0, total: TENANT_IDS.length })
 
+    // Common cleanup: called on both success and error exit paths
+    const resetLoadState = () => {
+      setLoading(false)
+      setIsRefreshing(false)
+      setLoadPhase('')
+      setRegionLoadStatus(new Map())
+    }
+
     try {
       // Phase 1: Fetch list for all tenants in parallel
       const listResults = await batchFetch(
@@ -1343,7 +1466,10 @@ export default function App() {
       if (thisRun.aborted) return
 
       // Build per-tenant task lists, ordered by tenant priority
-      const TENANT_PRIORITY = [62, 65, 45, 36, 84, 119, 10, 47, 118, 55, 72]
+      const BASE_PRIORITY = [62, 65, 45, 36, 84, 119, 10, 47, 118, 55, 72]
+      const TENANT_PRIORITY = favouriteTenant
+        ? [favouriteTenant, ...BASE_PRIORITY.filter(id => id !== favouriteTenant)]
+        : BASE_PRIORITY
       const SKIP_TITLE_RE = /test|deprecate|not in use/i
       const mainTasksByTenant = new Map()
       const otherTasksByTenant = new Map()
@@ -1499,69 +1625,161 @@ export default function App() {
 
       if (thisRun.aborted) return
 
-      // Phase 2b: Extract non-General regions from already-cached detail data (synchronous — no network)
+      // Phase 3: Fetch non-General region data
+      // Priority tenant (favourite or Video/62) fetches+processes first for fastest
+      // Regions page display, then remaining tenants follow in priority order.
       setLoadPhase('regions')
-      setLoadProgress({ done: 0, total: allTotal })
 
-      let regionDone = 0
+      // Build per-tenant UID lists (deduplicated globally for consistent behavior)
+      const uidsByTenant = new Map() // tenantId → [[uid, task], ...]
+      const seenUids = new Set()
       for (const tenantId of orderedTenantIds) {
-        if (thisRun.aborted) return
         const tasks = [
           ...(mainTasksByTenant.get(tenantId) || []),
           ...(otherTasksByTenant.get(tenantId) || []),
         ]
+        const uidPairs = []
         for (const task of tasks) {
-          const cacheKey = `${task.tenantId}:${task.regionPolicyID}`
-          const detailData = detailFetchCache.get(cacheKey)
-          if (!detailData) continue
-          let entries = transformDetailToEntries(detailData, task.tenantId, task.tenantName, task.listItem)
-          entries = entries.filter(e => e.region !== 'General')
-          for (const e of entries) {
-            e.id = entryId++
-            regionCounts[e.region] = (regionCounts[e.region] || 0) + 1
+          const uid = task.listItem.uid
+          if (uid && !seenUids.has(uid)) {
+            seenUids.add(uid)
+            uidPairs.push([uid, task])
           }
-          addFresh(entries)
         }
-        regionDone += tasks.length
-        setLoadProgress({ done: regionDone, total: allTotal })
+        if (uidPairs.length > 0) uidsByTenant.set(tenantId, uidPairs)
       }
 
-      // Final flush with all regions
-      flushMerged()
+      const totalUids = [...uidsByTenant.values()].reduce((sum, arr) => sum + arr.length, 0)
+      console.log(`[Phase3] Fetching region lists for ${totalUids} unique policy UIDs`)
+      let regionsDone = 0
+      setLoadProgress({ done: 0, total: totalUids })
+
+      // Initialize region load status
+      const regionStatusMap = new Map()
+      for (const id of orderedTenantIds) regionStatusMap.set(id, 'queued')
+      setRegionLoadStatus(new Map(regionStatusMap))
+
+      const markRegionTenant = (id, status) => {
+        regionStatusMap.set(id, status)
+        setRegionLoadStatus(new Map(regionStatusMap))
+      }
+
+      // O(1) index for General entries from Phase 2: key = "tenantId\tpolicyTitle"
+      const generalIndex = new Map()
+      for (const e of freshEntries) {
+        if (e.region !== 'General') continue
+        const key = `${e.tenant_id}\t${e.policy_title}`
+        if (!generalIndex.has(key)) generalIndex.set(key, [])
+        generalIndex.get(key).push(e)
+      }
+
+      // Fetch region lists + clone General entries for a single tenant, then flush
+      const processRegionTenant = async (tenantId) => {
+        const uidPairs = uidsByTenant.get(tenantId)
+        if (!uidPairs || uidPairs.length === 0) {
+          markRegionTenant(tenantId, 'done')
+          return
+        }
+
+        markRegionTenant(tenantId, 'loading')
+
+        // Fetch region lists for this tenant's UIDs
+        const results = await batchFetch(
+          uidPairs,
+          async ([uid, task]) => {
+            const regionData = await fetchPolicyRegionList(uid, task.tenantId, activeCookie)
+            return { uid, task, regionData }
+          },
+          20,
+          () => {
+            if (!thisRun.aborted) {
+              regionsDone++
+              setLoadProgress({ done: regionsDone, total: totalUids })
+            }
+          }
+        )
+
+        if (thisRun.aborted) return
+
+        // Clone General entries for each non-General region
+        for (const result of results) {
+          if (!result || !result.regionData) continue
+          const { task, regionData } = result
+          const regions = Array.isArray(regionData) ? regionData
+            : regionData.list ? regionData.list
+            : regionData.regions ? regionData.regions
+            : Array.isArray(regionData.data) ? regionData.data
+            : null
+          if (!regions || !Array.isArray(regions)) continue
+
+          const generalEntries = generalIndex.get(`${task.tenantId}\t${task.listItem.title}`) || []
+
+          for (const r of regions) {
+            const regionName = r.region || r.regionCode || r.region_code || r.area_code || r.name || r.areaCode || ''
+            if (!regionName || regionName === 'General') continue
+
+            const cloned = generalEntries.map(e => ({
+              ...e,
+              id: entryId++,
+              region: regionName,
+            }))
+            for (const e of cloned) {
+              regionCounts[e.region] = (regionCounts[e.region] || 0) + 1
+            }
+            addFresh(cloned)
+          }
+        }
+
+        markRegionTenant(tenantId, 'done')
+        flushMerged()
+        await new Promise(r => setTimeout(r, 0))
+      }
+
+      // Priority tenant loads first (favourite, or Video/62 by default)
+      const priorityTenantId = favouriteTenant || 62
+      console.log(`[Phase3] Priority tenant: ${shortTenant(TENANT_MAP[priorityTenantId])} (id=${priorityTenantId})`)
+      if (uidsByTenant.has(priorityTenantId)) {
+        await processRegionTenant(priorityTenantId)
+        console.log(`[Phase3] Priority tenant ${shortTenant(TENANT_MAP[priorityTenantId])} regions loaded and flushed`)
+        if (thisRun.aborted) { setRegionLoadStatus(new Map()); return }
+      }
+
+      // Process remaining tenants in priority order
+      for (const tenantId of orderedTenantIds) {
+        if (thisRun.aborted) { setRegionLoadStatus(new Map()); return }
+        if (tenantId === priorityTenantId) continue
+        await processRegionTenant(tenantId)
+      }
+
+      console.log(`[Phase3] Cloned General data for non-General regions (0 detail API calls)`)
 
       if (thisRun.aborted) return
 
       const allEntries = dataRef.current
-      console.log('[Data] Region distribution:', regionCounts)
-      console.log(`[Data] Total entries: ${allEntries.length}, Unique regions: ${[...new Set(allEntries.map(e => e.region))].join(', ')}`)
+      console.log('[Phase3] Region distribution:', regionCounts)
+      console.log(`[Phase3] Total entries: ${allEntries.length}, Unique regions: [${[...new Set(allEntries.map(e => e.region))].join(', ')}]`)
 
       setData(allEntries)
       setLastFetched(new Date())
-      setLoading(false)
-      setIsRefreshing(false)
-      setLoadPhase('')
+      resetLoadState()
 
       // Save to IndexedDB cache
       setCachedData(allEntries)
     } catch (err) {
       if (!thisRun.aborted) {
         console.error('Failed to load data:', err)
+        resetLoadState()
         if (err.message === 'AUTH_REQUIRED') {
           setNeedsAuth(true)
-          setLoading(false)
-          setIsRefreshing(false)
-          setLoadPhase('')
           setError('Session expired or invalid. Please update your cookie.')
         } else {
           setError(err.message)
-          setLoading(false)
-          setIsRefreshing(false)
-          setLoadPhase('')
         }
       }
     }
-  }, [cookie])
+  }, [cookie, favouriteTenant])
 
+  /** Called when user submits the cookie prompt — persist + kick off data load */
   const handleCookieSubmit = useCallback((newCookie) => {
     const trimmed = newCookie.trim()
     setCookie(trimmed)
@@ -1570,6 +1788,7 @@ export default function App() {
     loadData(trimmed)
   }, [loadData])
 
+  // Auto-load data on mount if a saved cookie exists
   useEffect(() => {
     if (cookie) loadData()
   }, []) // eslint-disable-line react-hooks/exhaustive-deps
@@ -1591,6 +1810,7 @@ export default function App() {
     return [...new Set(data.filter(e => e.cat0).map(e => e.cat0))].sort()
   }, [data])
 
+  /** Unique region names for the currently selected tenant (used by RegionMatrix columns) */
   const tenantRegions = useMemo(() => {
     if (!data || !selectedTenant) return []
     const regions = new Set()
@@ -1600,6 +1820,7 @@ export default function App() {
     return [...regions]
   }, [data, selectedTenant])
 
+  /** Default column order for Features tab: anchor tenant first, then DEFAULT_TENANT_ORDER, then rest */
   const defaultTenantColumnOrder = useMemo(() => {
     if (!allTenants.length) return []
     const ordered = []
@@ -1616,6 +1837,8 @@ export default function App() {
   const dragProps = useDraggableColumns(defaultTenantColumnOrder)
 
   // === VIEW 1: Tenant View Data ===
+  // Each row = one fuzzy policy group. `byTenant` maps tenant name → entries for matrix cells.
+  // Only General-region entries are shown (non-General handled by Regions tab).
   const tenantViewData = useMemo(() => {
     if (!fuzzyGroups) return []
     const rows = []
@@ -1633,7 +1856,7 @@ export default function App() {
     return rows
   }, [fuzzyGroups])
 
-  // Filtered tenant rows
+  // Apply user filters (multi-tenant, main verticals, category, search) to tenant rows
   const filteredTenantRows = useMemo(() => {
     let rows = tenantViewData
     if (multiTenantOnly) {
@@ -1664,6 +1887,8 @@ export default function App() {
   }, [tenantViewData, multiTenantOnly, mainVerticalsOnly, categoryFilter, search, anchorTenant])
 
   // === VIEW 2: Region View Data ===
+  // Each row = one fuzzy policy group for `selectedTenant`. `byRegion` maps region → entries.
+  // Only policies that have a General region are included (General is the baseline for diff).
   const regionViewData = useMemo(() => {
     if (!fuzzyGroups || !selectedTenant) return []
     const rows = []
@@ -1741,7 +1966,19 @@ export default function App() {
         <div className="loading-text">{pct}%</div>
         {tenantLoadStatus.size > 0 && (
           <div className="tenant-checklist">
+            <div className="tooltip-section-header">Tenants</div>
             {[...tenantLoadStatus.entries()].map(([id, status]) => (
+              <div key={id} className={`tenant-checklist-item ${status}`}>
+                <span className={`tenant-status-icon ${status}`} />
+                <span>{shortTenant(TENANT_MAP[id])}</span>
+              </div>
+            ))}
+          </div>
+        )}
+        {regionLoadStatus.size > 0 && (
+          <div className="tenant-checklist">
+            <div className="tooltip-section-header">Regions</div>
+            {[...regionLoadStatus.entries()].map(([id, status]) => (
               <div key={id} className={`tenant-checklist-item ${status}`}>
                 <span className={`tenant-status-icon ${status}`} />
                 <span>{shortTenant(TENANT_MAP[id])}</span>
@@ -1807,6 +2044,8 @@ export default function App() {
                 <span>
                   {loadPhase === 'lists'
                     ? `Fetching policy lists\u2026 ${loadProgress.done}/${loadProgress.total} tenants`
+                    : loadPhase === 'details' ? 'Loading details\u2026'
+                    : loadPhase === 'regions' ? 'Loading regions\u2026'
                     : loadPhase ? `Loading ${loadPhase}\u2026` : 'Refreshing\u2026'}
                 </span>
                 <span className="refresh-callout-pct">
@@ -1864,6 +2103,25 @@ export default function App() {
         </div>
 
         <div className={`toolbar-filters${mobileFiltersOpen ? ' open' : ''}`}>
+          <div className="filter-field">
+            <span className="filter-field-label">Favourite Tenant</span>
+            <div className="filter-field-tooltip">
+              Loads first when refreshing. Takes effect on next refresh.
+            </div>
+            <select
+              className="filter-select"
+              value={favouriteTenant || ''}
+              onChange={e => {
+                const val = e.target.value ? Number(e.target.value) : null
+                setFavouriteTenant(val)
+                saveFavouriteTenant(val)
+              }}
+            >
+              <option value="">None</option>
+              {TENANT_IDS.map(id => <option key={id} value={id}>{shortTenant(TENANT_MAP[id])}</option>)}
+            </select>
+          </div>
+
           <select
             className="filter-select"
             value={categoryFilter}
@@ -1981,14 +2239,30 @@ export default function App() {
           onClose={closeModal}
         />
       )}
-      {loadTooltip && tenantLoadStatus.size > 0 && createPortal(
+      {loadTooltip && (tenantLoadStatus.size > 0 || regionLoadStatus.size > 0) && createPortal(
         <div className="refresh-tooltip" style={{ top: loadTooltip.top, right: loadTooltip.right }}>
-          {[...tenantLoadStatus.entries()].map(([id, status]) => (
-            <div key={id} className={`tenant-checklist-item ${status}`}>
-              <span className={`tenant-status-icon ${status}`} />
-              <span>{shortTenant(TENANT_MAP[id])}</span>
-            </div>
-          ))}
+          {tenantLoadStatus.size > 0 && (
+            <>
+              <div className="tooltip-section-header">Tenants</div>
+              {[...tenantLoadStatus.entries()].map(([id, status]) => (
+                <div key={`t-${id}`} className={`tenant-checklist-item ${status}`}>
+                  <span className={`tenant-status-icon ${status}`} />
+                  <span>{shortTenant(TENANT_MAP[id])}</span>
+                </div>
+              ))}
+            </>
+          )}
+          {regionLoadStatus.size > 0 && (
+            <>
+              <div className="tooltip-section-header">Regions</div>
+              {[...regionLoadStatus.entries()].map(([id, status]) => (
+                <div key={`r-${id}`} className={`tenant-checklist-item ${status}`}>
+                  <span className={`tenant-status-icon ${status}`} />
+                  <span>{shortTenant(TENANT_MAP[id])}</span>
+                </div>
+              ))}
+            </>
+          )}
         </div>,
         document.body
       )}

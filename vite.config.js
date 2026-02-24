@@ -10,6 +10,8 @@ function onProxyReq(proxyReq, req) {
   }
   // Remove the custom header so it doesn't reach upstream
   proxyReq.removeHeader('x-pms-cookie')
+  // Set Referer to the target domain to avoid CSRF rejection
+  proxyReq.setHeader('Referer', 'https://pms-va.tiktok-row.net/')
 }
 
 export default defineConfig({
