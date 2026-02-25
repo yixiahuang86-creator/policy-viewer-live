@@ -217,6 +217,7 @@ function transformDetailToEntries(detailData, tenantId, tenantName, listItem) {
       children_action: ageGroup?.Children?.Action || '',
       tenant_id: tenantId,
       tenant_name: tenantName,
+      region_policy_id: regionData.ID || listItem.regionPolicyID || '',
     }
     entries.push(entry)
   }
@@ -620,6 +621,7 @@ function TenantDetailPopup({ groupLabel, entries, onClose }) {
             <th>Tenant</th>
             <th>Title</th>
             <th>Code</th>
+            <th>Labels</th>
             <th>Action</th>
             <th>Result</th>
           </tr>
@@ -631,8 +633,22 @@ function TenantDetailPopup({ groupLabel, entries, onClose }) {
                 {idx === 0 && (
                   <td className="tenant-col" rowSpan={tenantEntries.length}>{shortTenant(tenant)}</td>
                 )}
-                <td className="title-col" title={entry.policy_title}>{entry.policy_title}</td>
+                <td className="title-col" title={entry.policy_title}>
+                  {entry.region_policy_id ? (
+                    <a
+                      href={`https://pms-va.tiktok-row.net/policy/detail/${entry.region_policy_id}/en?businessLine=${entry.tenant_id}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      onClick={e => e.stopPropagation()}
+                    >{entry.policy_title}</a>
+                  ) : entry.policy_title}
+                </td>
                 <td className="code-col">{entry.policy_code}</td>
+                <td className="labels-col">
+                  {(entry.labels || []).map((lbl, li) => (
+                    <span key={li} className="label-chip">{lbl}</span>
+                  ))}
+                </td>
                 <td><ActionBadge value={getPrimaryAction(entry)} /></td>
                 <td><ResultSummary results={entry.results} /></td>
               </tr>
@@ -678,7 +694,16 @@ function RegionDetailPopup({ groupLabel, entries, onClose }) {
                 {idx === 0 && (
                   <td className="tenant-col" rowSpan={regionEntries.length}>{region}</td>
                 )}
-                <td className="title-col" title={entry.policy_title}>{entry.policy_title}</td>
+                <td className="title-col" title={entry.policy_title}>
+                  {entry.region_policy_id ? (
+                    <a
+                      href={`https://pms-va.tiktok-row.net/policy/detail/${entry.region_policy_id}/en?businessLine=${entry.tenant_id}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      onClick={e => e.stopPropagation()}
+                    >{entry.policy_title}</a>
+                  ) : entry.policy_title}
+                </td>
                 <td className="code-col">{entry.policy_code}</td>
                 <td className="labels-col">
                   {(entry.labels || []).map((lbl, li) => (
@@ -1714,14 +1739,22 @@ export default function App() {
 
           const generalEntries = generalIndex.get(`${task.tenantId}\t${task.listItem.title}`) || []
 
+          // Look up detail cache to get region-specific IDs
+          const detailCacheKey = `${task.tenantId}:${task.regionPolicyID}`
+          const cachedDetail = detailFetchCache.get(detailCacheKey)
+
           for (const r of regions) {
             const regionName = r.region || r.regionCode || r.region_code || r.area_code || r.name || r.areaCode || ''
             if (!regionName || regionName === 'General') continue
+
+            // Region-specific policy ID: prefer detail cache, then region list item, then General's ID
+            const regionPolicyId = cachedDetail?.regions?.[regionName]?.ID || r.ID || r.regionPolicyID || r.id || ''
 
             const cloned = generalEntries.map(e => ({
               ...e,
               id: entryId++,
               region: regionName,
+              ...(regionPolicyId ? { region_policy_id: regionPolicyId } : {}),
             }))
             for (const e of cloned) {
               regionCounts[e.region] = (regionCounts[e.region] || 0) + 1
@@ -1960,6 +1993,7 @@ export default function App() {
       <div className="loading-overlay">
         <div className="spinner" />
         <div className="loading-text">{phaseLabel}</div>
+        <div className="loading-hint">Initial load may take a moment. Future visits will use cached data for faster startup.</div>
         <div className="progress-bar-container">
           <div className="progress-bar-fill" style={{ width: `${pct}%` }} />
         </div>
