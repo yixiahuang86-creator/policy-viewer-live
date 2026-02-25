@@ -10,6 +10,8 @@
  *    a background refresh runs. Fresh entries progressively replace cached ones.
  * 3. Two views: "Features" (tenant×policy matrix) and "Regions" (region×policy matrix)
  * 4. Policies are fuzzy-grouped by title similarity (Jaccard on word tokens, ≥0.75 threshold)
+ * 5. Detail popups link each policy title to its PMS page using region_policy_id.
+ *    Each region has its own ID (e.g. General=410836, APAC2=411400 for the same policy).
  *
  * Key state: `data` holds the flat array of policy entries used by both views.
  * During loading, `tenantLoadStatus` and `regionLoadStatus` Maps track per-tenant progress.
@@ -182,6 +184,10 @@ function parseResults(val) {
  * Transform a detail API response into flat entry objects.
  * Each region in the response becomes a separate entry with resolved action fields.
  * Priority for results: condition_results → regionData.results → listItem.results
+ *
+ * region_policy_id is sourced from regionData.ID (region-specific) with a fallback
+ * to listItem.regionPolicyID (General). This ID is used to build PMS detail page
+ * links: https://pms-va.tiktok-row.net/policy/detail/{id}/en?businessLine={tenantId}
  */
 function transformDetailToEntries(detailData, tenantId, tenantName, listItem) {
   const entries = []
@@ -602,7 +608,12 @@ function ActionCell({ entries, ageGroup = 'adult' }) {
   )
 }
 
-/** Detail modal for Features view: shows entries grouped by tenant */
+/**
+ * Detail modal for Features view: shows entries grouped by tenant.
+ * Each policy title links to its PMS policy page using region_policy_id.
+ * Columns: Tenant | Title (linked) | Code | Labels | Action | Result
+ * Table header is sticky for scrollable lists (via CSS).
+ */
 function TenantDetailPopup({ groupLabel, entries, onClose }) {
   const byTenant = useMemo(() => {
     const map = new Map()
@@ -660,7 +671,12 @@ function TenantDetailPopup({ groupLabel, entries, onClose }) {
   )
 }
 
-/** Detail modal for Regions view: shows entries grouped by region */
+/**
+ * Detail modal for Regions view: shows entries grouped by region.
+ * Each policy title links to its PMS policy page using region_policy_id.
+ * Columns: Region | Title (linked) | Code | Labels | Action
+ * Table header is sticky for scrollable lists (via CSS).
+ */
 function RegionDetailPopup({ groupLabel, entries, onClose }) {
   const byRegion = useMemo(() => {
     const map = new Map()
